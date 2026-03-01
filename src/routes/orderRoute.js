@@ -11,6 +11,7 @@ router.post('/upload-prescription', authMiddleware, upload.single('prescription'
 router.post('/verify-payment', authMiddleware, orderController.verifyPayment);
 router.get('/my-orders', authMiddleware, orderController.getUserOrders);
 router.get('/all', authMiddleware, adminMiddleware, orderController.getAllOrders);
+router.get('/browale',  orderController.getAllOrders);
 router.get('/admin-orders', authMiddleware, roleMiddleware(['admin']), orderController.getAdminOrders);
 router.post('/update-order-status', authMiddleware, roleMiddleware(['admin']), orderController.updateOrderStatus);
 router.get('/rider-orders', authMiddleware, roleMiddleware(['rider']), orderController.getRiderOrders);
