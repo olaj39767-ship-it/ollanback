@@ -6,13 +6,7 @@ const crypto = require('crypto');
 const EmailService = require('../config/emailService'); // Import your EmailService
 
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+
 
 const signupSchema = Joi.object({
   email: Joi.string().email().required(),
@@ -232,34 +226,40 @@ exports.forgotPassword = async (req, res) => {
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const token = crypto.randomBytes(20).toString('hex');
-    user.resetPasswordToken = token;
-    user.resetPasswordExpires = Date.now() + 3600000; // 1 hour
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    user.resetPasswordToken = otp;
+    user.resetPasswordExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
     await user.save();
 
-    const resetLink = `http://localhost:3000/pages/reset-password/${token}`;
-    await transporter.sendMail({
-      to: email,
-      subject: 'Password Reset',
-      html: `Click <a href="${resetLink}">here</a> to reset your password.`,
-    });
+    const message = `
+      Hi ${user.name}!
+      You requested a password reset for your Ollan Pharmacy account.
+      Your password reset code is: <strong>${otp}</strong>
+      Enter this code to reset your password.
+      This code will expire in 10 minutes.
+      If you did not request this, please ignore this email.
+    `;
 
-    res.json({ message: 'Password reset email sent' });
+    await EmailService.sendTextEmail(email, 'Password Reset Code', message);
+
+    res.json({ message: 'Password reset code sent to your email' });
   } catch (error) {
+    console.error('forgotPassword error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
 exports.resetPassword = async (req, res) => {
-  const { token, password } = req.body;
+  const { email, otp, password } = req.body;
 
   try {
     const user = await User.findOne({
-      resetPasswordToken: token,
+      email,
+      resetPasswordToken: otp,
       resetPasswordExpires: { $gt: Date.now() },
     });
 
-    if (!user) return res.status(400).json({ message: 'Invalid or expired token' });
+    if (!user) return res.status(400).json({ message: 'Invalid or expired code' });
 
     user.password = password;
     user.resetPasswordToken = undefined;
@@ -268,6 +268,7 @@ exports.resetPassword = async (req, res) => {
 
     res.json({ message: 'Password reset successful' });
   } catch (error) {
+    console.error('resetPassword error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };

@@ -3,6 +3,7 @@ const dotenv = require("dotenv");
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const helmet = require("helmet");
 
 const app = express();
 
@@ -21,45 +22,81 @@ const connectDB = async () => {
   }
 };
 
-// CORS Configuration - Allow specific origins only
+// ── CORS ─────────────────────────────────────────────────────
 const corsOptions = {
   origin: [
-    'https://www.ollanpharmacy.ng',
-    'http://localhost:3000'
+    "https://www.ollanpharmacy.ng",
+    "http://localhost:3000",
   ],
-  credentials: true, // Allow credentials (cookies, authorization headers, etc.)
-  optionsSuccessStatus: 200, // For legacy browser support
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  credentials: true,
+  optionsSuccessStatus: 200,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
 };
 
-// Middleware
-app.use(cors(corsOptions));
-app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// ── Manual NoSQL injection sanitizer (replaces express-mongo-sanitize) ───
+const sanitize = (obj) => {
+  if (obj && typeof obj === "object") {
+    for (const key of Object.keys(obj)) {
+      if (key.startsWith("$") || key.includes(".")) {
+        delete obj[key];
+      } else {
+        sanitize(obj[key]);
+      }
+    }
+  }
+  return obj;
+};
 
-// Routes
+const mongoSanitizeMiddleware = (req, res, next) => {
+  if (req.body) sanitize(req.body);
+  if (req.params) sanitize(req.params);
+  next();
+};
+
+// ── Middleware ────────────────────────────────────────────────
+app.use(helmet());
+app.use(cors(corsOptions));
+app.use(express.json({ limit: "10kb" }));
+app.use(mongoSanitizeMiddleware); // ✅ replaces express-mongo-sanitize
+
+// ── Static files ──────────────────────────────────────────────
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+// ── Routes ────────────────────────────────────────────────────
 app.use("/api/auth", require("./routes/authRoute"));
 app.use("/api/user", require("./routes/userRoute"));
 app.use("/api/products", require("./routes/productRoute"));
 app.use("/api/cart", require("./routes/cartRoute"));
 app.use("/api/orders", require("./routes/orderRoute"));
 
-/**
- * ✅ Vercel expects an async function like this (serverless)
- * So we export it when being used as a module (e.g., in Vercel)
- */
+// ── 404 handler ───────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
+
+// ── Global error handler ──────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ message: "Internal server error" });
+});
+
+// ── Vercel serverless vs local dev ────────────────────────────
 if (process.env.IS_VERCEL) {
   module.exports = async (req, res) => {
     await connectDB();
     return app(req, res);
   };
 } else {
-  // ✅ For Fly.io or local dev: long-running server
   const PORT = process.env.PORT || 8080;
-  connectDB().then(() => {
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on http://localhost:${PORT}`);
+  connectDB()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`🚀 Server running on http://localhost:${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error("❌ MongoDB connection failed:", err.message);
+      process.exit(1);
     });
-  });
 }
