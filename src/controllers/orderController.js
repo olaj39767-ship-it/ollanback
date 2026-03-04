@@ -192,12 +192,12 @@ exports.createOrder = async (req, res) => {
     }
 
     const expectedDeliveryFee = total > 0
-      ? customerInfo.deliveryOption === 'express'
-        ? 1500
-        : customerInfo.deliveryOption === 'timeframe' && total < 5000
-        ? 500
-        : 0
-      : 0;
+  ? customerInfo.deliveryOption === 'express'
+    ? 0  // free for now
+    : customerInfo.deliveryOption === 'timeframe' && total < 5000
+    ? 500
+    : 0
+  : 0;
 
     if (deliveryFee !== expectedDeliveryFee) {
       return res.status(400).json({ message: 'Invalid delivery fee' });
