@@ -167,7 +167,7 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ message: 'Invalid transaction number' });
     }
 
-  const { cartItems } = req.body;
+const { items: cartItems } = req.body;
 
 if (!cartItems || cartItems.length === 0) {
   return res.status(400).json({ message: 'Cart is empty' });
@@ -177,8 +177,8 @@ let total = 0;
 const items = [];
 
 for (const item of cartItems) {
-const productId = typeof item.productId === 'object' ? item.productId._id : item.productId;
-const product = await Product.findById(productId);
+  const productId = typeof item.productId === 'object' ? item.productId._id : item.productId;
+  const product = await Product.findById(productId);
   if (!product || product.stock < item.quantity) {
     return res.status(400).json({ message: `Insufficient stock for ${product?.name || 'item'}` });
   }
