@@ -144,99 +144,147 @@ async function sendOrderNotification(order, status, additionalInfo = '') {
 
 exports.createOrder = async (req, res) => {
   const user = req.user;
-  const { customerInfo, deliveryFee, prescriptionUrl } = req.body;
+
+  // ────────────────────────────────────────────────
+  // Destructure the slim payload you're now sending
+  // ────────────────────────────────────────────────
+  const { customerInfo, items: cartItems, prescriptionUrl = "" } = req.body;
 
   try {
-    // Log request body for debugging
-    logger.info(`Create order request for user ${user._id}: ${JSON.stringify(req.body)}`);
+    // Basic presence checks
+    if (!user) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
 
     if (
-      !user ||
       !customerInfo ||
-      !customerInfo.name ||
-      !customerInfo.email ||
-      !customerInfo.phone ||
-      !customerInfo.transactionNumber ||
-      deliveryFee === undefined
+      !customerInfo.name?.trim() ||
+      !customerInfo.email?.trim() ||
+      !customerInfo.phone?.trim() ||
+      !customerInfo.transactionNumber?.trim() ||
+      !customerInfo.deliveryOption
     ) {
-      return res.status(400).json({ message: 'All required fields must be provided' });
+      return res.status(400).json({ message: "Missing or invalid customer information" });
     }
 
-    // Validate transactionNumber format (example: at least 6 characters)
-    if (!customerInfo.transactionNumber.trim() || customerInfo.transactionNumber.length < 6) {
-      return res.status(400).json({ message: 'Invalid transaction number' });
+    if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
+      return res.status(400).json({ message: "Cart is empty" });
     }
 
-const { items: cartItems } = req.body;
-
-if (!cartItems || cartItems.length === 0) {
-  return res.status(400).json({ message: 'Cart is empty' });
-}
-
-let total = 0;
-const items = [];
-
-for (const item of cartItems) {
-  const productId = typeof item.productId === 'object' ? item.productId._id : item.productId;
-  const product = await Product.findById(productId);
-  if (!product || product.stock < item.quantity) {
-    return res.status(400).json({ message: `Insufficient stock for ${product?.name || 'item'}` });
-  }
-  product.stock -= item.quantity;
-  await product.save();
-  total += product.price * item.quantity;
-  items.push({
-    productId: product._id,
-    quantity: item.quantity,
-    price: product.price,
-  });
-}
-
-    const expectedDeliveryFee = total > 0
-  ? customerInfo.deliveryOption === 'express'
-    ? 0  // free for now
-    : customerInfo.deliveryOption === 'timeframe' && total < 5000
-    ? 500
-    : 0
-  : 0;
-
-    if (deliveryFee !== expectedDeliveryFee) {
-      return res.status(400).json({ message: 'Invalid delivery fee' });
+    // Validate transaction number (adjust rules as needed)
+    const txNumber = customerInfo.transactionNumber.trim();
+    if (txNumber.length < 6) {
+      return res.status(400).json({ message: "Transaction number is too short" });
     }
 
-    const totalAmount = total + deliveryFee;
+    // ────────────────────────────────────────────────
+    // Process cart items + calculate real total from DB
+    // ────────────────────────────────────────────────
+    let subtotal = 0;
+    const validatedItems = [];
 
+    for (const item of cartItems) {
+      const productId = item.productId; // now just string _id
+
+      if (!productId || !item.quantity || item.quantity < 1) {
+        return res.status(400).json({ message: "Invalid cart item format" });
+      }
+
+      const product = await Product.findById(productId);
+      if (!product) {
+        return res.status(400).json({ message: `Product not found: ${productId}` });
+      }
+
+      if (product.stock < item.quantity) {
+        return res.status(400).json({
+          message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
+        });
+      }
+
+      // Deduct stock
+      product.stock -= item.quantity;
+      await product.save();
+
+      const itemPrice = product.price; // could add bundle/discount logic here later
+      const itemTotal = itemPrice * item.quantity;
+
+      subtotal += itemTotal;
+
+      validatedItems.push({
+        productId: product._id,
+        quantity: item.quantity,
+        price: itemPrice,           // snapshot of price at order time
+        name: product.name,         // optional – helpful for display & auditing
+        // image: product.image,    // optional
+      });
+    }
+
+    // ────────────────────────────────────────────────
+    // Calculate delivery fee based on your business rules
+    // ────────────────────────────────────────────────
+    let deliveryFee = 0;
+
+    const option = customerInfo.deliveryOption.toLowerCase();
+
+    if (option === "express") {
+      deliveryFee = 0; // free for now – change if needed
+    } else if (option === "timeframe") {
+      deliveryFee = subtotal < 5000 ? 500 : 0;
+    } else if (option === "pickup") {
+      deliveryFee = 0;
+    } else {
+      return res.status(400).json({ message: "Invalid delivery option" });
+    }
+
+    const totalAmount = subtotal + deliveryFee;
+
+    // ────────────────────────────────────────────────
+    // Create the order
+    // ────────────────────────────────────────────────
     const order = new Order({
       user: user._id,
-      items,
-      customerInfo,
+      items: validatedItems,
+      customerInfo: {
+        name: customerInfo.name.trim(),
+        email: customerInfo.email.trim(),
+        phone: customerInfo.phone.trim(),
+        deliveryOption: customerInfo.deliveryOption,
+        deliveryAddress: customerInfo.deliveryAddress?.trim() || null,
+        pickupLocation: customerInfo.pickupLocation?.trim() || null,
+        timeSlot: customerInfo.timeSlot?.trim() || null,
+        transactionNumber: txNumber,
+        estimatedDelivery: customerInfo.estimatedDelivery || "Pending confirmation",
+      },
       deliveryFee,
-      prescriptionUrl,
+      subtotal,               // optional – useful for reporting
       totalAmount,
-      transactionNumber: customerInfo.transactionNumber,
+      prescriptionUrl,
       paymentReference: `OLLAN_${Date.now()}_${Math.floor(Math.random() * 1000000)}`,
-      status: 'pending',
+      status: "pending",
     });
 
     const savedOrder = await order.save();
 
-    // Broadcast new order to all connected admins
+    // Your existing side-effects
     orderEventManager.broadcastOrderUpdate({
-      type: 'new_order',
+      type: "new_order",
       order: savedOrder,
-      message: `New order #${savedOrder._id.toString().slice(-6)} created by ${customerInfo.name}`
+      message: `New order #${savedOrder._id.toString().slice(-6)} created by ${customerInfo.name}`,
     });
 
-    // Invalidate admin orders cache
     invalidateAdminOrdersCache();
 
-    await sendOrderNotification(savedOrder, 'pending');
+    await sendOrderNotification(savedOrder, "pending");
 
-    logger.info(`Order created for user: ${user._id}`);
-    res.status(201).json({ message: 'Order created', order: savedOrder });
+    logger.info(`Order created for user: ${user._id} – Order ID: ${savedOrder._id}`);
+
+    return res.status(201).json({
+      message: "Order created successfully",
+      order: savedOrder,
+    });
   } catch (error) {
-    logger.error(`Create order error for user ${user._id}: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    logger.error(`Create order error for user ${user?._id || "unknown"}: ${error.message}`, { error });
+    return res.status(500).json({ message: "Server error", error: error.message });
   }
 };
 
