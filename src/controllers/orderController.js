@@ -167,29 +167,30 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ message: 'Invalid transaction number' });
     }
 
-    const cart = await Cart.findOne({ userId: user._id }).populate('items.productId');
-    if (!cart || cart.items.length === 0) {
-      return res.status(400).json({ message: 'Cart is empty' });
-    }
+  const { cartItems } = req.body;
 
-    let total = 0;
-    const items = cart.items.map((item) => {
-      total += item.productId.price * item.quantity;
-      return {
-        productId: item.productId._id,
-        quantity: item.quantity,
-        price: item.productId.price,
-      };
-    });
+if (!cartItems || cartItems.length === 0) {
+  return res.status(400).json({ message: 'Cart is empty' });
+}
 
-    for (const item of cart.items) {
-      const product = await Product.findById(item.productId);
-      if (!product || product.stock < item.quantity) {
-        return res.status(400).json({ message: `Insufficient stock for ${product?.name || 'item'}` });
-      }
-      product.stock -= item.quantity;
-      await product.save();
-    }
+let total = 0;
+const items = [];
+
+for (const item of cartItems) {
+const productId = typeof item.productId === 'object' ? item.productId._id : item.productId;
+const product = await Product.findById(productId);
+  if (!product || product.stock < item.quantity) {
+    return res.status(400).json({ message: `Insufficient stock for ${product?.name || 'item'}` });
+  }
+  product.stock -= item.quantity;
+  await product.save();
+  total += product.price * item.quantity;
+  items.push({
+    productId: product._id,
+    quantity: item.quantity,
+    price: product.price,
+  });
+}
 
     const expectedDeliveryFee = total > 0
   ? customerInfo.deliveryOption === 'express'
@@ -218,7 +219,6 @@ exports.createOrder = async (req, res) => {
     });
 
     const savedOrder = await order.save();
-    await Cart.findOneAndDelete({ userId: user._id });
 
     // Broadcast new order to all connected admins
     orderEventManager.broadcastOrderUpdate({
