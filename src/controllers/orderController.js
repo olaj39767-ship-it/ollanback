@@ -142,20 +142,19 @@ async function sendOrderNotification(order, status, additionalInfo = '') {
   }
 }
 
-exports.createOrder = async (req, res) => {
-  const user = req.user;
 
-  // ────────────────────────────────────────────────
-  // Destructure the slim payload you're now sending
-  // ────────────────────────────────────────────────
-  const { customerInfo, items: cartItems, prescriptionUrl = "" } = req.body;
+exports.createOrder = async (req, res) => {
+  const user = req.user; // may be undefined → guest
+
+  const { 
+    customerInfo, 
+    items: cartItems, 
+    prescriptionUrl = "",
+    referralCode,
+  } = req.body;
 
   try {
-    // Basic presence checks
-    if (!user) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
-
+    // ─── Required validation ────────────────────────────────
     if (
       !customerInfo ||
       !customerInfo.name?.trim() ||
@@ -171,28 +170,21 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ message: "Cart is empty" });
     }
 
-    // Validate transaction number (adjust rules as needed)
     const txNumber = customerInfo.transactionNumber.trim();
     if (txNumber.length < 6) {
-      return res.status(400).json({ message: "Transaction number is too short" });
+      return res.status(400).json({ message: "Transaction number too short" });
     }
 
-    // ────────────────────────────────────────────────
-    // Process cart items + calculate real total from DB
-    // ────────────────────────────────────────────────
+    const normalizedEmail = customerInfo.email.trim().toLowerCase();
+
+    // ─── Process items + stock deduction ────────────────────
     let subtotal = 0;
     const validatedItems = [];
 
     for (const item of cartItems) {
-      const productId = item.productId; // now just string _id
-
-      if (!productId || !item.quantity || item.quantity < 1) {
-        return res.status(400).json({ message: "Invalid cart item format" });
-      }
-
-      const product = await Product.findById(productId);
+      const product = await Product.findById(item.productId);
       if (!product) {
-        return res.status(400).json({ message: `Product not found: ${productId}` });
+        return res.status(400).json({ message: `Product not found: ${item.productId}` });
       }
 
       if (product.stock < item.quantity) {
@@ -201,52 +193,39 @@ exports.createOrder = async (req, res) => {
         });
       }
 
-      // Deduct stock
       product.stock -= item.quantity;
       await product.save();
 
-      const itemPrice = product.price; // could add bundle/discount logic here later
-      const itemTotal = itemPrice * item.quantity;
-
-      subtotal += itemTotal;
+      subtotal += product.price * item.quantity;
 
       validatedItems.push({
         productId: product._id,
         quantity: item.quantity,
-        price: itemPrice,           // snapshot of price at order time
-        name: product.name,         // optional – helpful for display & auditing
-        // image: product.image,    // optional
+        price: product.price,
+        name: product.name,
       });
     }
 
-    // ────────────────────────────────────────────────
-    // Calculate delivery fee based on your business rules
-    // ────────────────────────────────────────────────
+    // ─── Delivery fee ────────────────────────────────────────
     let deliveryFee = 0;
-
     const option = customerInfo.deliveryOption.toLowerCase();
 
-    if (option === "express") {
-      deliveryFee = 0; // free for now – change if needed
-    } else if (option === "timeframe") {
-      deliveryFee = subtotal < 5000 ? 500 : 0;
-    } else if (option === "pickup") {
-      deliveryFee = 0;
-    } else {
-      return res.status(400).json({ message: "Invalid delivery option" });
-    }
+    if (option === "express") deliveryFee = 0;
+    else if (option === "timeframe") deliveryFee = subtotal < 5000 ? 500 : 0;
+    else if (option === "pickup") deliveryFee = 0;
+    else return res.status(400).json({ message: "Invalid delivery option" });
 
     const totalAmount = subtotal + deliveryFee;
 
-    // ────────────────────────────────────────────────
-    // Create the order
-    // ────────────────────────────────────────────────
+    // ─── Create order ────────────────────────────────────────
     const order = new Order({
-      user: user._id,
+      user: user ? user._id : null,
+      isGuest: !user,
+      guestIp: !user ? req.ip : undefined,
       items: validatedItems,
       customerInfo: {
         name: customerInfo.name.trim(),
-        email: customerInfo.email.trim(),
+        email: normalizedEmail,
         phone: customerInfo.phone.trim(),
         deliveryOption: customerInfo.deliveryOption,
         deliveryAddress: customerInfo.deliveryAddress?.trim() || null,
@@ -256,7 +235,8 @@ exports.createOrder = async (req, res) => {
         estimatedDelivery: customerInfo.estimatedDelivery || "Pending confirmation",
       },
       deliveryFee,
-      subtotal,               // optional – useful for reporting
+      subtotal,
+      referralCodeUsed: referralCode ? referralCode.trim().toUpperCase() : null,
       totalAmount,
       prescriptionUrl,
       paymentReference: `OLLAN_${Date.now()}_${Math.floor(Math.random() * 1000000)}`,
@@ -265,26 +245,77 @@ exports.createOrder = async (req, res) => {
 
     const savedOrder = await order.save();
 
-    // Your existing side-effects
+    // ─── Events & notifications ──────────────────────────────
     orderEventManager.broadcastOrderUpdate({
       type: "new_order",
       order: savedOrder,
-      message: `New order #${savedOrder._id.toString().slice(-6)} created by ${customerInfo.name}`,
+      message: `New order #${savedOrder._id.toString().slice(-6)} created by ${customerInfo.name} (${user ? 'registered' : 'guest'})`,
     });
 
     invalidateAdminOrdersCache();
 
     await sendOrderNotification(savedOrder, "pending");
 
-    logger.info(`Order created for user: ${user._id} – Order ID: ${savedOrder._id}`);
+    logger.info(`Order created → ${user ? `user:${user._id}` : `guest:${normalizedEmail}`} – ID: ${savedOrder._id}`);
 
     return res.status(201).json({
       message: "Order created successfully",
       order: savedOrder,
+      suggestRegistration: !user && savedOrder.customerInfo.email,
     });
   } catch (error) {
-    logger.error(`Create order error for user ${user?._id || "unknown"}: ${error.message}`, { error });
+    logger.error(`Create order error: ${error.message}`, { stack: error.stack });
     return res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// ────────────────────────────────────────────────────────────────
+//                        VERIFY PAYMENT + COUNT REFERRAL
+// ────────────────────────────────────────────────────────────────
+exports.verifyPayment = async (req, res) => {
+  const { orderId, paymentDetails } = req.body;
+  const adminId = req.user?._id;
+
+  try {
+    if (!orderId) return res.status(400).json({ message: 'Order ID is required' });
+    if (req.user?.role !== 'admin') return res.status(403).json({ message: 'Only admins can verify payments' });
+
+    const order = await Order.findById(orderId).populate('items.productId user');
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (order.status !== 'pending') return res.status(400).json({ message: `Order already ${order.status}` });
+
+    order.status = 'processing';
+    order.paymentDetails = paymentDetails || 'Manually verified by seller';
+    order.paymentReference = order.paymentReference || `MANUAL_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
+
+    const updatedOrder = await order.save();
+
+    // Count verified referral usage (if any)
+    if (updatedOrder.referralCodeUsed) {
+      const ref = await ReferralCode.findOne({ code: updatedOrder.referralCodeUsed });
+      if (ref) {
+        ref.verifiedPurchases += 1;
+        ref.updatedAt = new Date();
+        await ref.save();
+        logger.info(`Referral code ${ref.code} verified purchase count → ${ref.verifiedPurchases}`);
+      }
+    }
+
+    orderEventManager.broadcastOrderUpdate({
+      type: 'payment_verified',
+      order: updatedOrder,
+      message: `Payment verified for order #${orderId.slice(-6)}`
+    });
+
+    invalidateAdminOrdersCache();
+
+    await sendOrderNotification(updatedOrder, 'processing', paymentDetails);
+
+    logger.info(`Payment verified for order ${orderId} by admin ${adminId}`);
+    res.json({ message: 'Payment verified', order: updatedOrder });
+  } catch (error) {
+    logger.error(`Payment verification error: ${error.message}`, { orderId });
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -301,73 +332,25 @@ exports.uploadPrescription = async (req, res) => {
   }
 };
 
-exports.verifyPayment = async (req, res) => {
-  const { orderId, paymentDetails } = req.body;
-  const adminId = req.user._id;
-
-  try {
-    if (!orderId) {
-      logger.error(`Missing required field: orderId=${orderId}`);
-      return res.status(400).json({ message: 'Order ID is required' });
-    }
-
-    if (req.user.role !== 'admin') {
-      logger.error(`Unauthorized payment verification attempt by user: ${adminId}`);
-      return res.status(403).json({ message: 'Unauthorized: Only admins can verify payments' });
-    }
-
-    const order = await Order.findById(orderId).populate('items.productId user');
-    if (!order) {
-      logger.error(`Order not found for orderId: ${orderId}`);
-      return res.status(404).json({ message: 'Order not found' });
-    }
-
-    if (order.status !== 'pending') {
-      logger.error(`Order ${orderId} is not in pending status: ${order.status}`);
-      return res.status(400).json({ message: 'Order is not in pending status' });
-    }
-
-    order.status = 'processing';
-    order.paymentDetails = paymentDetails || 'Manually verified by seller';
-    order.paymentReference = order.paymentReference || `MANUAL_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
-
-    const updatedOrder = await order.save();
-
-    // Broadcast payment verification to all connected admins
-    orderEventManager.broadcastOrderUpdate({
-      type: 'payment_verified',
-      order: updatedOrder,
-      message: `Payment verified for order #${orderId.slice(-6)} by admin`
-    });
-
-    // Invalidate cache
-    invalidateAdminOrdersCache();
-
-    await sendOrderNotification(updatedOrder, 'processing', paymentDetails);
-
-    logger.info(`Payment manually verified for order: ${orderId} by admin: ${adminId}`);
-    res.json({ message: 'Payment manually verified', order: updatedOrder });
-  } catch (error) {
-    logger.error(`Manual payment verification error for order ${orderId}: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
 exports.getUserOrders = async (req, res) => {
-  const userEmail = req.user.email;
+  const user = req.user;
+  const { email } = req.query;
 
   try {
-    if (!userEmail) {
-      logger.error('User email not provided in request');
-      return res.status(400).json({ message: 'User email is required' });
+    let searchEmail = user ? user.email : (email || '').trim().toLowerCase();
+
+    if (!searchEmail) {
+      return res.status(400).json({ message: 'Email required for guest lookup' });
     }
 
-    const orders = await Order.find({ 'customerInfo.email': userEmail }).populate('items.productId');
-    logger.info(`Orders retrieved for user email: ${userEmail}, count: ${orders.length}`);
+    const orders = await Order.find({ 'customerInfo.email': searchEmail })
+      .populate('items.productId')
+      .sort({ createdAt: -1 });
+
     res.json(orders);
   } catch (error) {
-    logger.error(`Get user orders error for email ${userEmail}: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    logger.error(`Get orders error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 };
 

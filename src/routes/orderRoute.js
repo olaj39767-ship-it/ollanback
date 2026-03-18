@@ -1,12 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const orderController = require('../controllers/orderController');
+const referralController = require('../controllers/ReferralCode')
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 const upload = require('../middleware/upload');
 const roleMiddleware = require('../middleware/roleMiddleware');
 
 // Existing REST API routes
-router.post('/create', authMiddleware, orderController.createOrder);
+router.post('/create', orderController.createOrder);
 router.post('/upload-prescription', authMiddleware, upload.single('prescription'), orderController.uploadPrescription);
 router.post('/verify-payment', authMiddleware, orderController.verifyPayment);
 router.get('/my-orders', authMiddleware, orderController.getUserOrders);
@@ -21,6 +22,7 @@ router.get('/riders', authMiddleware, roleMiddleware(['admin']), orderController
 router.post('/send-prescription', orderController.sendPrescription);
 router.get('/track', orderController.trackOrder); // Unprotected tracking endpoint
 router.post('/share-tracking', authMiddleware, orderController.shareOrderTracking); // Protected endpoint for admins
+// Referral routes
 
 
 module.exports = router;
