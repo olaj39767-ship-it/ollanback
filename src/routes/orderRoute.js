@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const orderController = require('../controllers/orderController');
-const referralController = require('../controllers/ReferralCode')
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 const upload = require('../middleware/upload');
 const roleMiddleware = require('../middleware/roleMiddleware');
