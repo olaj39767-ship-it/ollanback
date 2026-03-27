@@ -45,3 +45,27 @@ exports.updateProfile = async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+exports.getAllUsers = async (req, res) => {
+  try {
+    // Fetch all users but exclude sensitive fields like password
+    const users = await User.find()
+      .select('-password -__v')   // remove password and version field
+      .sort({ createdAt: -1 });   // newest users first
+
+    logger.info(`Public accessed all users - ${users.length} users returned`);
+
+    res.status(200).json({
+      success: true,
+      count: users.length,
+      data: users
+    });
+
+  } catch (error) {
+    logger.error('Get all users error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while fetching users'
+    });
+  }
+};
