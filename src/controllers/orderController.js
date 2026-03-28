@@ -1,42 +1,13 @@
 const orderEventManager = require('../events/orderEvents');
 const Order = require('../models/Order');
-const Cart = require('../models/Cart');
 const Product = require('../models/Product');
 const User = require('../models/User');
-const ReferralCode = require('../models/ReferralCode'); // ← add this import
 const emailService = require('../config/emailService');
 const formidable = require('formidable');
 const fs = require('fs/promises');
 const logger = require('../config/logger');
 
-// ─── Valid promo / referral codes ───────────────────────────────────────────
-// Single source of truth. Add or remove codes here; the seeder below will
-// sync them to the DB so stats are always tracked against real documents.
-const VALID_REFERRAL_CODES = ['MZ10', 'OY10', 'EM10', 'TL10', 'BSP10'];
-
-/**
- * Call once at server startup (e.g. in app.js after DB connect) to ensure
- * every valid code has a ReferralCode document in the database.
- *
- *   const { seedReferralCodes } = require('./controllers/orderController');
- *   seedReferralCodes();
- */
-const seedReferralCodes = async () => {
-  try {
-    for (const code of VALID_REFERRAL_CODES) {
-      await ReferralCode.findOneAndUpdate(
-        { code },
-        { $setOnInsert: { code, totalUses: 0, verifiedPurchases: 0, isActive: true } },
-        { upsert: true, new: true }
-      );
-    }
-    logger.info(`Referral codes seeded: ${VALID_REFERRAL_CODES.join(', ')}`);
-  } catch (err) {
-    logger.error(`Failed to seed referral codes: ${err.message}`);
-  }
-};
-
-// ─── In-memory cache ─────────────────────────────────────────────────────────
+// ─── In-memory cache for admin orders ───
 const adminOrdersCache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
 
@@ -55,7 +26,7 @@ const invalidateAdminOrdersCache = (adminId = null) => {
   adminId ? adminOrdersCache.delete(adminId) : adminOrdersCache.clear();
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helper: Send order notification ───
 async function sendOrderNotification(order, status, additionalInfo = '') {
   try {
     const { email, name } = order.customerInfo;
@@ -66,7 +37,309 @@ async function sendOrderNotification(order, status, additionalInfo = '') {
   }
 }
 
-// ─── sendPrescription ────────────────────────────────────────────────────────
+// ====================== CREATE ORDER ======================
+// ====================== CREATE ORDER ======================
+exports.createOrder = async (req, res) => {
+  const user = req.user || null;
+
+  const {
+    customerInfo,
+    items: cartItems,
+    prescriptionUrl = '',
+    referralCode,
+    storeCreditApplied = false,  // boolean flag from frontend — never trust an amount
+  } = req.body;
+
+  console.log('req.user:', user);
+  console.log('storeCreditApplied flag from body:', storeCreditApplied);
+
+  try {
+    if (
+      !customerInfo?.name?.trim() ||
+      !customerInfo?.email?.trim() ||
+      !customerInfo?.phone?.trim() ||
+      !customerInfo?.transactionNumber?.trim() ||
+      !customerInfo?.deliveryOption
+    ) {
+      return res.status(400).json({ message: 'Missing required customer information' });
+    }
+
+    if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
+      return res.status(400).json({ message: 'Cart is empty' });
+    }
+
+    const txNumber = customerInfo.transactionNumber.trim();
+    if (txNumber.length < 6) {
+      return res.status(400).json({ message: 'Transaction number too short' });
+    }
+
+    let normalizedReferral = referralCode ? referralCode.trim().toUpperCase() : null;
+    const normalizedEmail = customerInfo.email.trim().toLowerCase();
+
+    // === Calculate subtotal first ===
+    let subtotal = 0;
+    const validatedItems = [];
+
+    for (const item of cartItems) {
+      const product = await Product.findById(item.productId);
+      if (!product) {
+        return res.status(400).json({ message: `Product not found: ${item.productId}` });
+      }
+
+      if (product.stock < item.quantity) {
+        return res.status(400).json({
+          message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
+        });
+      }
+
+      product.stock -= item.quantity;
+      await product.save();
+
+      subtotal += product.price * item.quantity;
+      validatedItems.push({
+        productId: product._id,
+        quantity: item.quantity,
+        price: product.price,
+        name: product.name,
+      });
+    }
+
+    let deliveryFee = 0;
+    const option = customerInfo.deliveryOption.toLowerCase();
+    if (option === 'express') deliveryFee = 0;
+    else if (option === 'timeframe') deliveryFee = subtotal < 5000 ? 500 : 0;
+    else if (option === 'pickup') deliveryFee = 0;
+    else return res.status(400).json({ message: 'Invalid delivery option' });
+
+    const totalAmount = subtotal + deliveryFee;
+
+    // === Read store credit from DB — amount never comes from frontend ===
+    let creditUsed = 0;
+
+    if (storeCreditApplied && user) {
+      const userDoc = await User.findById(user._id);
+      if (!userDoc) return res.status(404).json({ message: 'User not found' });
+
+      const availableCredit = userDoc.storeCredit || 0;
+      if (availableCredit > 0) {
+        // Cap at total order amount — user can't get change back
+        creditUsed = Math.min(availableCredit, totalAmount);
+        console.log(`Store credit to use: ₦${creditUsed} (available: ₦${availableCredit})`);
+      }
+    }
+
+    const finalPayable = Math.max(0, totalAmount - creditUsed);
+
+    const order = new Order({
+      user: user ? user._id : null,
+      isGuest: !user,
+      guestIp: !user ? req.ip : undefined,
+      items: validatedItems,
+      customerInfo: {
+        name: customerInfo.name.trim(),
+        email: normalizedEmail,
+        phone: customerInfo.phone.trim(),
+        deliveryOption: customerInfo.deliveryOption,
+        deliveryAddress: customerInfo.deliveryAddress?.trim() || null,
+        pickupLocation: customerInfo.pickupLocation?.trim() || null,
+        timeSlot: customerInfo.timeSlot?.trim() || null,
+        transactionNumber: txNumber,
+        estimatedDelivery: customerInfo.estimatedDelivery || 'Pending confirmation',
+      },
+      deliveryFee,
+      subtotal,
+      totalAmount,
+      storeCreditUsed: creditUsed,
+      finalPayable,
+      referralCodeUsed: normalizedReferral,
+      prescriptionUrl,
+      paymentReference: `OLLAN_${Date.now()}_${Math.floor(Math.random() * 1000000)}`,
+      status: 'pending',
+    });
+
+    const savedOrder = await order.save();
+
+    // === Deduct store credit using $inc to prevent race conditions ===
+    if (user && creditUsed > 0) {
+      await User.findByIdAndUpdate(
+        user._id,
+        { $inc: { storeCredit: -creditUsed } },
+        { new: true }
+      );
+      logger.info(
+        `Store credit deducted: ₦${creditUsed} from user ${user.email} for order ${savedOrder._id}`
+      );
+    }
+
+    logger.info(
+      `Order created: ${savedOrder._id} | Referral: ${normalizedReferral || 'None'} | Store Credit Used: ₦${creditUsed}`
+    );
+
+    orderEventManager.broadcastOrderUpdate({
+      type: 'new_order',
+      order: savedOrder,
+      message: `New order #${savedOrder._id.toString().slice(-6)} created`,
+    });
+
+    invalidateAdminOrdersCache();
+    await sendOrderNotification(savedOrder, 'pending');
+
+    return res.status(201).json({
+      message: 'Order created successfully',
+      orderId: savedOrder._id,
+      order: savedOrder,
+      storeCreditApplied: creditUsed > 0,
+      storeCreditAmount: creditUsed,
+      finalPayable,
+      suggestRegistration: !user && normalizedEmail,
+    });
+  } catch (error) {
+    logger.error(`Create order error: ${error.message}`, { stack: error.stack });
+    return res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ====================== VERIFY PAYMENT + 3% REFERRAL BONUS ======================
+exports.verifyPayment = async (req, res) => {
+  const { orderId, paymentDetails } = req.body;
+  const adminId = req.user?._id;
+
+  try {
+    if (!orderId) return res.status(400).json({ message: 'Order ID is required' });
+    if (req.user?.role !== 'admin') return res.status(403).json({ message: 'Only admins can verify payments' });
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (order.status !== 'pending') {
+      return res.status(400).json({ message: `Order is already ${order.status}` });
+    }
+
+    order.status = 'processing';
+    order.paymentDetails = paymentDetails || 'Manually verified by admin';
+    order.paymentReference = order.paymentReference || `MANUAL_${Date.now()}`;
+
+    const updatedOrder = await order.save();
+
+    // Apply 3% store credit to referrer after payment verification
+    if (updatedOrder.referralCodeUsed) {
+      const referrer = await User.findOne({ referralCode: updatedOrder.referralCodeUsed });
+
+      if (referrer) {
+        const bonusAmount = Math.round(updatedOrder.subtotal * 0.03 * 100) / 100;
+
+        referrer.addStoreCredit(bonusAmount);
+        await referrer.save();
+
+        logger.info(`✅ 3% Referral bonus: ${bonusAmount} credited to ${referrer.email} | Code: ${updatedOrder.referralCodeUsed} | Order: ${orderId}`);
+      } else {
+        logger.warn(`Referral code ${updatedOrder.referralCodeUsed} used but no matching user found`);
+      }
+    }
+
+    orderEventManager.broadcastOrderUpdate({
+      type: 'payment_verified',
+      order: updatedOrder,
+      message: `Payment verified for order #${orderId.slice(-6)}`,
+    });
+
+    invalidateAdminOrdersCache();
+    await sendOrderNotification(updatedOrder, 'processing', paymentDetails);
+
+    res.json({
+      success: true,
+      message: 'Payment verified successfully. Referral bonus applied if applicable.',
+      order: updatedOrder
+    });
+  } catch (error) {
+    logger.error(`Payment verification error: ${error.message}`, { orderId });
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ====================== UPLOAD PRESCRIPTION ======================
+exports.uploadPrescription = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    const prescriptionUrl = `/uploads/${req.file.filename}`;
+
+    logger.info(`Prescription uploaded: ${prescriptionUrl} by user ${req.user?._id || 'guest'}`);
+
+    res.status(200).json({
+      success: true,
+      message: 'Prescription uploaded successfully',
+      prescriptionUrl
+    });
+  } catch (error) {
+    logger.error(`Upload prescription error: ${error.message}`);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ====================== REFERRAL ANALYTICS ======================
+exports.getReferralAnalytics = async (req, res) => {
+  try {
+    if (req.user?.role !== 'admin') {
+      return res.status(403).json({ message: 'Only admins can access referral analytics' });
+    }
+
+    const referrers = await User.find({
+      referralCode: { $exists: true, $ne: null }
+    }).select('name email referralCode storeCredit').lean();
+
+    const analytics = [];
+
+    for (const referrer of referrers) {
+      const ordersUsingCode = await Order.countDocuments({
+        referralCodeUsed: referrer.referralCode,
+        status: { $in: ['processing', 'accepted', 'delivered'] }
+      });
+
+      const totalBonusResult = await Order.aggregate([
+        { 
+          $match: { 
+            referralCodeUsed: referrer.referralCode,
+            status: { $in: ['processing', 'accepted', 'delivered'] }
+          }
+        },
+        { $group: { _id: null, totalSubtotal: { $sum: '$subtotal' } } }
+      ]);
+
+      const totalEarned = totalBonusResult.length > 0 
+        ? Math.round(totalBonusResult[0].totalSubtotal * 0.03 * 100) / 100 
+        : 0;
+
+      analytics.push({
+        userId: referrer._id,
+        name: referrer.name,
+        email: referrer.email,
+        referralCode: referrer.referralCode,
+        currentStoreCredit: referrer.storeCredit || 0,
+        timesUsed: ordersUsingCode,
+        totalEarnedFromReferrals: totalEarned
+      });
+    }
+
+    analytics.sort((a, b) => b.timesUsed - a.timesUsed);
+
+    const totalReferralsUsed = analytics.reduce((sum, item) => sum + item.timesUsed, 0);
+
+    res.json({
+      success: true,
+      totalReferrers: analytics.length,
+      totalReferralsUsed,
+      data: analytics
+    });
+  } catch (error) {
+    logger.error(`Referral analytics error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// ====================== YOUR ORIGINAL FUNCTIONS (PRESERVED) ======================
+
 exports.sendPrescription = async (req, res) => {
   try {
     const form = new formidable.IncomingForm({ multiples: true });
@@ -87,8 +360,7 @@ exports.sendPrescription = async (req, res) => {
 
     const allowedTypes = [
       'image/jpeg', 'image/png', 'application/pdf',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     ];
     const invalidFiles = fileArray.filter((f) => !allowedTypes.includes(f.mimetype));
     if (invalidFiles.length > 0) return res.status(400).json({ message: 'Only JPEG, PNG, PDF, DOC, DOCX files are allowed' });
@@ -120,262 +392,6 @@ exports.sendPrescription = async (req, res) => {
   }
 };
 
-// ─── createOrder ─────────────────────────────────────────────────────────────
-exports.createOrder = async (req, res) => {
-  const user = req.user; // may be undefined → guest
-
-  const {
-    customerInfo,
-    items: cartItems,
-    prescriptionUrl = '',
-    referralCode,
-  } = req.body;
-
-  try {
-    // ── Validation ──────────────────────────────────────────
-    if (
-      !customerInfo ||
-      !customerInfo.name?.trim() ||
-      !customerInfo.email?.trim() ||
-      !customerInfo.phone?.trim() ||
-      !customerInfo.transactionNumber?.trim() ||
-      !customerInfo.deliveryOption
-    ) {
-      return res.status(400).json({ message: 'Missing or invalid customer information' });
-    }
-
-    if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
-      return res.status(400).json({ message: 'Cart is empty' });
-    }
-
-    const txNumber = customerInfo.transactionNumber.trim();
-    if (txNumber.length < 6) {
-      return res.status(400).json({ message: 'Transaction number too short' });
-    }
-
-    // ── Referral code validation ────────────────────────────
-    let normalizedReferral = null;
-    if (referralCode && referralCode.trim()) {
-      normalizedReferral = referralCode.trim().toUpperCase();
-
-      if (!VALID_REFERRAL_CODES.includes(normalizedReferral)) {
-        return res.status(400).json({ message: `Invalid referral code: ${referralCode}` });
-      }
-    }
-
-    const normalizedEmail = customerInfo.email.trim().toLowerCase();
-
-    // ── Stock deduction & subtotal ──────────────────────────
-    let subtotal = 0;
-    const validatedItems = [];
-
-    for (const item of cartItems) {
-      const product = await Product.findById(item.productId);
-      if (!product) return res.status(400).json({ message: `Product not found: ${item.productId}` });
-
-      if (product.stock < item.quantity) {
-        return res.status(400).json({
-          message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
-        });
-      }
-
-      product.stock -= item.quantity;
-      await product.save();
-
-      subtotal += product.price * item.quantity;
-      validatedItems.push({ productId: product._id, quantity: item.quantity, price: product.price, name: product.name });
-    }
-
-    // ── Delivery fee ────────────────────────────────────────
-    let deliveryFee = 0;
-    const option = customerInfo.deliveryOption.toLowerCase();
-    if (option === 'express') deliveryFee = 0;
-    else if (option === 'timeframe') deliveryFee = subtotal < 5000 ? 500 : 0;
-    else if (option === 'pickup') deliveryFee = 0;
-    else return res.status(400).json({ message: 'Invalid delivery option' });
-
-    const totalAmount = subtotal + deliveryFee;
-
-    // ── Persist order ───────────────────────────────────────
-    const order = new Order({
-      user: user ? user._id : null,
-      isGuest: !user,
-      guestIp: !user ? req.ip : undefined,
-      items: validatedItems,
-      customerInfo: {
-        name: customerInfo.name.trim(),
-        email: normalizedEmail,
-        phone: customerInfo.phone.trim(),
-        deliveryOption: customerInfo.deliveryOption,
-        deliveryAddress: customerInfo.deliveryAddress?.trim() || null,
-        pickupLocation: customerInfo.pickupLocation?.trim() || null,
-        timeSlot: customerInfo.timeSlot?.trim() || null,
-        transactionNumber: txNumber,
-        estimatedDelivery: customerInfo.estimatedDelivery || 'Pending confirmation',
-      },
-      deliveryFee,
-      subtotal,
-      referralCodeUsed: normalizedReferral, // stored as uppercase, e.g. "MZ10"
-      totalAmount,
-      prescriptionUrl,
-      paymentReference: `OLLAN_${Date.now()}_${Math.floor(Math.random() * 1000000)}`,
-      status: 'pending',
-    });
-
-    const savedOrder = await order.save();
-
-    // ── Increment totalUses on the referral code doc ────────
-    if (normalizedReferral) {
-      await ReferralCode.findOneAndUpdate(
-        { code: normalizedReferral },
-        { $inc: { totalUses: 1 } }
-      );
-      logger.info(`Referral code ${normalizedReferral} totalUses incremented`);
-    }
-
-    // ── Events & notifications ──────────────────────────────
-    orderEventManager.broadcastOrderUpdate({
-      type: 'new_order',
-      order: savedOrder,
-      message: `New order #${savedOrder._id.toString().slice(-6)} created by ${customerInfo.name} (${user ? 'registered' : 'guest'})`,
-    });
-
-    invalidateAdminOrdersCache();
-    await sendOrderNotification(savedOrder, 'pending');
-
-    logger.info(`Order created → ${user ? `user:${user._id}` : `guest:${normalizedEmail}`} – ID: ${savedOrder._id}`);
-
-    return res.status(201).json({
-      message: 'Order created successfully',
-      order: savedOrder,
-      suggestRegistration: !user && savedOrder.customerInfo.email,
-    });
-  } catch (error) {
-    logger.error(`Create order error: ${error.message}`, { stack: error.stack });
-    return res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// ─── verifyPayment ───────────────────────────────────────────────────────────
-exports.verifyPayment = async (req, res) => {
-  const { orderId, paymentDetails } = req.body;
-  const adminId = req.user?._id;
-
-  try {
-    if (!orderId) return res.status(400).json({ message: 'Order ID is required' });
-    if (req.user?.role !== 'admin') return res.status(403).json({ message: 'Only admins can verify payments' });
-
-    const order = await Order.findById(orderId).populate('items.productId user');
-    if (!order) return res.status(404).json({ message: 'Order not found' });
-    if (order.status !== 'pending') return res.status(400).json({ message: `Order already ${order.status}` });
-
-    order.status = 'processing';
-    order.paymentDetails = paymentDetails || 'Manually verified by seller';
-    order.paymentReference = order.paymentReference || `MANUAL_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
-
-    const updatedOrder = await order.save();
-
-    // Increment verifiedPurchases on the referral code doc
-    if (updatedOrder.referralCodeUsed) {
-      const ref = await ReferralCode.findOneAndUpdate(
-        { code: updatedOrder.referralCodeUsed },
-        { $inc: { verifiedPurchases: 1 }, $set: { updatedAt: new Date() } },
-        { new: true }
-      );
-      if (ref) {
-        logger.info(`Referral code ${ref.code} verifiedPurchases → ${ref.verifiedPurchases}`);
-      } else {
-        logger.warn(`Referral code ${updatedOrder.referralCodeUsed} not found in DB during payment verification`);
-      }
-    }
-
-    orderEventManager.broadcastOrderUpdate({
-      type: 'payment_verified',
-      order: updatedOrder,
-      message: `Payment verified for order #${orderId.slice(-6)}`,
-    });
-
-    invalidateAdminOrdersCache();
-    await sendOrderNotification(updatedOrder, 'processing', paymentDetails);
-
-    logger.info(`Payment verified for order ${orderId} by admin ${adminId}`);
-    res.json({ message: 'Payment verified', order: updatedOrder });
-  } catch (error) {
-    logger.error(`Payment verification error: ${error.message}`, { orderId });
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// ─── getReferralStats  (admin only) ─────────────────────────────────────────
-/**
- * GET /api/orders/referral-stats
- * Returns usage stats for every referral code.
- *
- * Response shape:
- * {
- *   "stats": [
- *     {
- *       "code": "MZ10",
- *       "totalUses": 12,          // submitted at checkout (pending or not)
- *       "verifiedPurchases": 9,   // payment actually verified by admin
- *       "pendingVerification": 3, // totalUses - verifiedPurchases
- *       "isActive": true,
- *       "lastUpdated": "2025-..."
- *     },
- *     ...
- *   ],
- *   "totals": {
- *     "totalUses": 30,
- *     "verifiedPurchases": 22
- *   }
- * }
- */
-exports.getReferralStats = async (req, res) => {
-  try {
-    if (req.user?.role !== 'admin') {
-      return res.status(403).json({ message: 'Only admins can view referral stats' });
-    }
-
-    const codes = await ReferralCode.find().sort({ totalUses: -1 }).lean();
-
-    const stats = codes.map((c) => ({
-      code: c.code,
-      totalUses: c.totalUses,
-      verifiedPurchases: c.verifiedPurchases,
-      pendingVerification: c.totalUses - c.verifiedPurchases,
-      isActive: c.isActive,
-      lastUpdated: c.updatedAt,
-    }));
-
-    const totals = stats.reduce(
-      (acc, c) => {
-        acc.totalUses += c.totalUses;
-        acc.verifiedPurchases += c.verifiedPurchases;
-        return acc;
-      },
-      { totalUses: 0, verifiedPurchases: 0 }
-    );
-
-    logger.info(`Referral stats fetched by admin ${req.user._id}`);
-    res.json({ stats, totals });
-  } catch (error) {
-    logger.error(`Get referral stats error: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// ─── uploadPrescription ──────────────────────────────────────────────────────
-exports.uploadPrescription = async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-    res.json({ prescriptionUrl: `/uploads/${req.file.filename}` });
-  } catch (error) {
-    logger.error(`Upload prescription error: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// ─── getUserOrders ───────────────────────────────────────────────────────────
 exports.getUserOrders = async (req, res) => {
   const user = req.user;
   const { email } = req.query;
@@ -395,10 +411,13 @@ exports.getUserOrders = async (req, res) => {
   }
 };
 
-// ─── getAllOrders ────────────────────────────────────────────────────────────
 exports.getAllOrders = async (req, res) => {
   try {
-    const orders = await Order.find().populate('user items.productId');
+    const orders = await Order.find()
+      .populate('items.productId')
+      .populate('user', 'name email')
+      .sort({ createdAt: -1 });
+
     logger.info(`All orders retrieved, count: ${orders.length}`);
     res.json(orders);
   } catch (error) {
@@ -407,7 +426,6 @@ exports.getAllOrders = async (req, res) => {
   }
 };
 
-// ─── getAdminOrders ──────────────────────────────────────────────────────────
 exports.getAdminOrders = async (req, res) => {
   const adminId = req.user._id;
 
@@ -434,7 +452,6 @@ exports.getAdminOrders = async (req, res) => {
   }
 };
 
-// ─── updateOrderStatus ───────────────────────────────────────────────────────
 exports.updateOrderStatus = async (req, res) => {
   const { orderId, action } = req.body;
   const adminId = req.user._id;
@@ -453,7 +470,10 @@ exports.updateOrderStatus = async (req, res) => {
       additionalInfo = 'Please contact customer service for more information.';
       for (const item of order.items) {
         const product = await Product.findById(item.productId);
-        if (product) { product.stock += item.quantity; await product.save(); }
+        if (product) { 
+          product.stock += item.quantity; 
+          await product.save(); 
+        }
       }
     }
 
@@ -476,7 +496,6 @@ exports.updateOrderStatus = async (req, res) => {
   }
 };
 
-// ─── updateDeliveryStatus ────────────────────────────────────────────────────
 exports.updateDeliveryStatus = async (req, res) => {
   const { orderId, deliveryStatus } = req.body;
   const riderId = req.user._id;
@@ -509,7 +528,6 @@ exports.updateDeliveryStatus = async (req, res) => {
   }
 };
 
-// ─── getRiderOrders ──────────────────────────────────────────────────────────
 exports.getRiderOrders = async (req, res) => {
   const riderId = req.user._id;
 
@@ -524,7 +542,6 @@ exports.getRiderOrders = async (req, res) => {
   }
 };
 
-// ─── assignOrder ─────────────────────────────────────────────────────────────
 exports.assignOrder = async (req, res) => {
   const { orderId, riderId } = req.body;
 
@@ -556,7 +573,6 @@ exports.assignOrder = async (req, res) => {
   }
 };
 
-// ─── getRiders ───────────────────────────────────────────────────────────────
 exports.getRiders = async (req, res) => {
   try {
     const riders = await User.find({ role: 'rider' }).select('_id name');
@@ -567,48 +583,6 @@ exports.getRiders = async (req, res) => {
   }
 };
 
-// ─── pollOrders ──────────────────────────────────────────────────────────────
-exports.pollOrders = async (req, res) => {
-  try {
-    const orders = await Order.find()
-      .populate('items.productId')
-      .populate('user', 'name email')
-      .populate('rider', 'name');
-    res.json(orders);
-  } catch (error) {
-    logger.error(`Poll orders error: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// ─── clearOrderCache ─────────────────────────────────────────────────────────
-exports.clearOrderCache = async (req, res) => {
-  try {
-    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Unauthorized' });
-    invalidateAdminOrdersCache();
-    logger.info(`Order cache cleared by admin: ${req.user._id}`);
-    res.json({ message: 'Order cache cleared successfully' });
-  } catch (error) {
-    logger.error(`Clear cache error: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// ─── dropOrderCollection ─────────────────────────────────────────────────────
-exports.dropOrderCollection = async (req, res) => {
-  try {
-    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Unauthorized' });
-    await Order.collection.drop();
-    invalidateAdminOrdersCache();
-    logger.info(`Order collection dropped by admin: ${req.user._id}`);
-    res.json({ message: 'Order collection dropped and caches cleared' });
-  } catch (error) {
-    logger.error(`Drop collection error: ${error.message}`);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// ─── trackOrder ──────────────────────────────────────────────────────────────
 exports.trackOrder = async (req, res) => {
   const { orderId, transactionNumber } = req.query;
 
@@ -651,7 +625,6 @@ exports.trackOrder = async (req, res) => {
   }
 };
 
-// ─── shareOrderTracking ──────────────────────────────────────────────────────
 exports.shareOrderTracking = async (req, res) => {
   const { orderId } = req.body;
   const adminId = req.user._id;
@@ -687,5 +660,15 @@ exports.shareOrderTracking = async (req, res) => {
   }
 };
 
-// Export seeder so app.js can call it on startup
-exports.seedReferralCodes = seedReferralCodes;
+// Clear cache
+exports.clearOrderCache = async (req, res) => {
+  try {
+    if (req.user?.role !== 'admin') return res.status(403).json({ message: 'Unauthorized' });
+    invalidateAdminOrdersCache();
+    logger.info(`Order cache cleared by admin: ${req.user._id}`);
+    res.json({ message: 'Order cache cleared successfully' });
+  } catch (error) {
+    logger.error(`Clear cache error: ${error.message}`);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
