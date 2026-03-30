@@ -1,6 +1,6 @@
 const { MongoClient, Int32 } = require("mongodb");
 
-const MONGODB_URI = process.env.MONGODB_URI; // or paste your URI directly
+const MONGODB_URI = "mongodb+srv://olaj39767:HasstpdmYQrCZztP@cluster0.ywktsea.mongodb.net/";
 const DB_NAME = "test"; // replace with your actual db name
 const COLLECTION = "users"; // replace with your actual collection name
 

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const orderController = require('../controllers/orderController');
+const ProductController = require('../controllers/productController');
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 const optionalAuth = require('../middleware/optionalAuth'); // ← add this
 const upload = require('../middleware/upload');
@@ -9,7 +10,7 @@ const roleMiddleware = require('../middleware/roleMiddleware');
 // ROUTES ONLY HERE
 
 router.post('/create', optionalAuth, orderController.createOrder);
-router.post('/upload-prescription', authMiddleware, upload.single('prescription'), orderController.uploadPrescription);
+
 router.post('/verify-payment', authMiddleware, adminMiddleware, orderController.verifyPayment);
 
 router.get('/my-orders', authMiddleware, orderController.getUserOrders);
@@ -27,7 +28,14 @@ router.get('/riders', authMiddleware, roleMiddleware(['admin']), orderController
 router.post('/send-prescription', orderController.sendPrescription);
 router.get('/track', orderController.trackOrder);
 router.post('/share-tracking', authMiddleware, roleMiddleware(['admin']), orderController.shareOrderTracking);
+// No auth required - anyone can upload a prescription
+router.post('/upload-prescription', 
+  upload.single('prescription'), 
+  ProductController.uploadPrescription
+);
 
+// New: Get ALL prescriptions (no login required)
+router.get('/prescriptions', ProductController.getAllPrescriptions);
 router.post('/clear-cache', authMiddleware, roleMiddleware(['admin']), orderController.clearOrderCache);
 
 module.exports = router;

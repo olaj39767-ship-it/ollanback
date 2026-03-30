@@ -1,7 +1,81 @@
 const Product = require("../models/Product");
-const logger = require("../config/logger");
+const Prescription = require("../models/Prescription");  
 const { cloudinary, uploadToCloudinary } = require("../config/cloudinary");
 
+exports.uploadPrescription = async (req, res) => {
+  let uploadedFile = null;   // For cleanup on error
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    console.log("Uploaded prescription file:", req.file); // Debug
+
+    // Upload to Cloudinary (same as product image)
+    try {
+      uploadedFile = await uploadToCloudinary(req.file.buffer);
+      logger.info(`Prescription uploaded to Cloudinary: ${uploadedFile.public_id}`);
+    } catch (uploadError) {
+      logger.error("Cloudinary prescription upload error:", uploadError);
+      return res.status(500).json({ message: "File upload failed" });
+    }
+
+    // Save to database (similar to how you save Product)
+    const newPrescription = await new Prescription({
+      user: req.user ? req.user._id || req.user.id : null,
+      prescriptionUrl: uploadedFile.secure_url,
+      publicId: uploadedFile.public_id,
+      originalName: req.file.originalname,
+      mimeType: req.file.mimetype,
+    }).save();
+
+    logger.info(`Prescription uploaded successfully: ${uploadedFile.secure_url} by user ${req.user ? (req.user._id || req.user.id) : 'unknown'}`);
+
+    res.status(201).json({
+      success: true,
+      message: 'Prescription uploaded successfully',
+      prescriptionUrl: uploadedFile.secure_url,
+      publicId: uploadedFile.public_id,
+      prescriptionId: newPrescription._id
+    });
+
+  } catch (error) {
+    // Cleanup Cloudinary file if upload succeeded but DB save failed
+    if (uploadedFile && uploadedFile.public_id) {
+      try {
+        await cloudinary.uploader.destroy(uploadedFile.public_id);
+        logger.info(`Cleaned up Cloudinary prescription on error: ${uploadedFile.public_id}`);
+      } catch (cleanupError) {
+        logger.error("Error cleaning up Cloudinary prescription:", cleanupError);
+      }
+    }
+
+    logger.error("Upload prescription error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+// Get all prescriptions for the logged-in user
+// Get ALL prescriptions with date (no authentication)
+exports.getAllPrescriptions = async (req, res) => {
+  try {
+    const prescriptions = await Prescription.find({})
+      .select('prescriptionUrl originalName mimeType uploadedAt')
+      .sort({ uploadedAt: -1 });   // newest first
+
+    logger.info(`All prescriptions retrieved - ${prescriptions.length} found`);
+
+    res.status(200).json({
+      success: true,
+      count: prescriptions.length,
+      prescriptions
+    });
+  } catch (error) {
+    logger.error("Get all prescriptions error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
 exports.createProduct = async (req, res) => {
   const { name, description, price, stock, category } = req.body;
   let uploadedImage = null;
