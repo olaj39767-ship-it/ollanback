@@ -60,11 +60,19 @@ exports.uploadPrescription = async (req, res) => {
 // Get ALL prescriptions with date (no authentication)
 exports.getAllPrescriptions = async (req, res) => {
   try {
-    const prescriptions = await Prescription.find({})
-      .select('prescriptionUrl originalName mimeType uploadedAt')
-      .sort({ uploadedAt: -1 });   // newest first
+    const { startDate, endDate } = req.query;
 
-    logger.info(`All prescriptions retrieved - ${prescriptions.length} found`);
+    let query = {};
+
+    if (startDate || endDate) {
+      query.uploadedAt = {};
+      if (startDate) query.uploadedAt.$gte = new Date(startDate);
+      if (endDate) query.uploadedAt.$lte = new Date(endDate);
+    }
+
+    const prescriptions = await Prescription.find(query)
+      .select('prescriptionUrl originalName mimeType uploadedAt')
+      .sort({ uploadedAt: -1 });
 
     res.status(200).json({
       success: true,
