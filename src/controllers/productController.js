@@ -74,7 +74,6 @@ exports.getAllPrescriptions = async (req, res) => {
     }
 
     const prescriptions = await Prescription.find(query)
-      .select('prescriptionUrl originalName mimeType uploadedAt')
       .sort({ uploadedAt: -1 });
 
     res.status(200).json({
@@ -82,6 +81,7 @@ exports.getAllPrescriptions = async (req, res) => {
       count: prescriptions.length,
       prescriptions
     });
+
   } catch (error) {
     logger.error("Get all prescriptions error:", error);
     res.status(500).json({ message: "Server error" });
