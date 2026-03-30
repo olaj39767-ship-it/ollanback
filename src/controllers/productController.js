@@ -1,6 +1,7 @@
 const Product = require("../models/Product");
 const Prescription = require("../models/Prescription");  
 const { cloudinary, uploadToCloudinary } = require("../config/cloudinary");
+const logger = require('../config/logger');
 
 exports.uploadPrescription = async (req, res) => {
   let uploadedFile = null;   // For Cloudinary cleanup on error
