@@ -4,7 +4,7 @@ const { cloudinary, uploadToCloudinary } = require("../config/cloudinary");
 const logger = require('../config/logger');
 
 exports.uploadPrescription = async (req, res) => {
-  let uploadedFile = null;   // For Cloudinary cleanup on error
+  let uploadedFile = null;
 
   try {
     if (!req.file) {
@@ -14,69 +14,51 @@ exports.uploadPrescription = async (req, res) => {
       });
     }
 
-    console.log("Uploaded prescription file:", req.file);
+    // Upload to Cloudinary
+    uploadedFile = await uploadToCloudinary(req.file.buffer);
+    logger.info(`Prescription uploaded to Cloudinary: ${uploadedFile.public_id}`);
 
-    // 1. Upload file to Cloudinary
-    try {
-      uploadedFile = await uploadToCloudinary(req.file.buffer);
-      logger.info(`Prescription uploaded to Cloudinary: ${uploadedFile.public_id}`);
-    } catch (uploadError) {
-      logger.error("Cloudinary prescription upload error:", uploadError);
-      return res.status(500).json({ 
-        success: false, 
-        message: "File upload to Cloudinary failed" 
-      });
-    }
-
-    // 2. Save to database with form data from frontend
+    // Save to DB
     const newPrescription = await new Prescription({
-      // User info (null since no auth)
       user: null,
-
-      // Personal details coming from frontend form
       name: req.body.name?.trim(),
       email: req.body.email?.trim(),
       phone: req.body.phone?.trim(),
       location: req.body.location?.trim(),
 
-      // Cloudinary file data
       prescriptionUrl: uploadedFile.secure_url,
       publicId: uploadedFile.public_id,
       originalName: req.file.originalname,
       mimeType: req.file.mimetype,
+      uploadedAt: new Date(),           // Explicitly add this
     }).save();
 
-    logger.info(`Prescription uploaded successfully by ${req.body.name || 'Guest'} - ID: ${newPrescription._id}`);
+    logger.info(`Prescription uploaded by ${req.body.name || 'Guest'} - ID: ${newPrescription._id}`);
 
-    // Success response
     res.status(201).json({
       success: true,
       message: 'Prescription uploaded successfully. Our team will contact you shortly.',
       prescriptionId: newPrescription._id,
       prescriptionUrl: uploadedFile.secure_url,
-      // Optional: helpful for debugging
-      originalName: req.file.originalname
     });
 
   } catch (error) {
-    // Cleanup Cloudinary file if DB save fails
-    if (uploadedFile && uploadedFile.public_id) {
+    // Cleanup Cloudinary on error
+    if (uploadedFile?.public_id) {
       try {
         await cloudinary.uploader.destroy(uploadedFile.public_id);
-        logger.info(`Cleaned up Cloudinary file after error: ${uploadedFile.public_id}`);
       } catch (cleanupError) {
-        logger.error("Error cleaning up Cloudinary file:", cleanupError);
+        logger.error("Cloudinary cleanup failed:", cleanupError);
       }
     }
 
     logger.error("Upload prescription error:", error);
     res.status(500).json({ 
       success: false, 
-      message: "Server error while saving prescription" 
+      message: error.message || "Server error while saving prescription" 
     });
   }
 };
-
 // Get all prescriptions for the logged-in user
 // Get ALL prescriptions with date (no authentication)
 exports.getAllPrescriptions = async (req, res) => {
