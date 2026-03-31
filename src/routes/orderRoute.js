@@ -6,12 +6,15 @@ const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 const optionalAuth = require('../middleware/optionalAuth'); // ← add this
 const upload = require('../middleware/upload');
 const roleMiddleware = require('../middleware/roleMiddleware');
+const { verifyFlutterwavePayment } = require('../controllers/paymentController');
 
 // ROUTES ONLY HERE
 
 router.post('/create', optionalAuth, orderController.createOrder);
 
 router.post('/verify-payment', authMiddleware, adminMiddleware, orderController.verifyPayment);
+router.post('/verify-payment-real', verifyFlutterwavePayment);
+
 
 router.get('/my-orders', authMiddleware, orderController.getUserOrders);
 router.get('/all', authMiddleware, adminMiddleware, orderController.getAllOrders);
