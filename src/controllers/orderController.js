@@ -225,7 +225,7 @@ exports.verifyPayment = async (req, res) => {
       const referrer = await User.findOne({ referralCode: updatedOrder.referralCodeUsed });
 
       if (referrer) {
-        const bonusAmount = Math.round(updatedOrder.subtotal * 0.03 * 100) / 100;
+        const bonusAmount = Math.round(updatedOrder.subtotal * 0.1 * 100) / 100;
 
         referrer.addStoreCredit(bonusAmount);
         await referrer.save();
