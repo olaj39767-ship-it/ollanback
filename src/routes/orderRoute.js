@@ -8,12 +8,12 @@ const upload = require('../middleware/upload');
 const roleMiddleware = require('../middleware/roleMiddleware');
 const { verifyFlutterwavePayment } = require('../controllers/paymentController');
 
-// ── Webhook: needs raw body, exported separately for server.js ──
+// ── Webhook router (exported separately so server.js can give it raw body) ──
 const webhookRouter = express.Router();
 webhookRouter.post('/', orderController.handleFlutterwaveWebhook);
 
-// ── All other order routes ──────────────────────────────────────
-router.post('/create-pending', optionalAuth, orderController.createPendingOrder); // ✅ removed duplicate /orders/
+// ── All other order routes ─────────────────────────────────────────────────
+router.post('/create-pending', optionalAuth, orderController.createPendingOrder);
 router.post('/create', optionalAuth, orderController.createOrder);
 
 router.post('/verify-payment', authMiddleware, adminMiddleware, orderController.verifyPayment);
@@ -40,4 +40,4 @@ router.get('/prescriptions', ProductController.getAllPrescriptions);
 router.post('/clear-cache', authMiddleware, roleMiddleware(['admin']), orderController.clearOrderCache);
 
 module.exports = router;
-module.exports.webhookRouter = webhookRouter; // ✅ named export for server.js
+module.exports.webhookRouter = webhookRouter;

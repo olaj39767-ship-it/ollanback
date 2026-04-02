@@ -18,7 +18,7 @@ const connectDB = async () => {
     isConnected = true;
     console.log("✅ MongoDB connected");
 
-    // Start cleanup job AFTER DB is connected
+    // Start cleanup job only after DB is ready
     require("./utils/cleanupPendingOrders");
   }
 };
@@ -53,40 +53,41 @@ const mongoSanitizeMiddleware = (req, res, next) => {
 app.use(helmet());
 app.use(cors(corsOptions));
 
-// ── Webhook MUST come before express.json() ───────────────────
-// Flutterwave needs the raw body for signature verification
+// ── Webhook MUST be registered before express.json() ──────────────────────
+// Flutterwave sends a raw body — if express.json() runs first it breaks
+// the signature verification
 app.use(
   "/api/orders/webhook/flutterwave",
   express.raw({ type: "application/json" }),
   require("./routes/orderRoute").webhookRouter
 );
 
-// ── JSON parsing for all other routes ────────────────────────
+// ── JSON parsing for everything else ──────────────────────────────────────
 app.use(express.json({ limit: "10kb" }));
 app.use(mongoSanitizeMiddleware);
 
-// ── Static files ──────────────────────────────────────────────
+// ── Static files ───────────────────────────────────────────────────────────
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// ── Routes ────────────────────────────────────────────────────
+// ── Routes ─────────────────────────────────────────────────────────────────
 app.use("/api/auth", require("./routes/authRoute"));
 app.use("/api/user", require("./routes/userRoute"));
 app.use("/api/products", require("./routes/productRoute"));
 app.use("/api/cart", require("./routes/cartRoute"));
 app.use("/api/orders", require("./routes/orderRoute"));
 
-// ── 404 handler ───────────────────────────────────────────────
+// ── 404 handler ────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });
 });
 
-// ── Global error handler ──────────────────────────────────────
+// ── Global error handler ───────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ message: "Internal server error" });
 });
 
-// ── Vercel serverless vs local dev ────────────────────────────
+// ── Vercel serverless vs local dev ─────────────────────────────────────────
 if (process.env.IS_VERCEL) {
   module.exports = async (req, res) => {
     await connectDB();
