@@ -200,62 +200,111 @@ exports.createOrder = async (req, res) => {
 };
 
 // ====================== CREATE PENDING ORDER (before payment) ======================
-const mongoose = require('mongoose');
+exports.createPendingOrder = async (req, res) => {
+  const user = req.user || null;
+  const { customerInfo, items: cartItems, storeCreditApplied = false } = req.body;
 
-const orderSchema = new mongoose.Schema({
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // null for guests
-  isGuest: { type: Boolean, default: false },
-  guestIp: { type: String, default: null },
-  items: [
-    {
-      productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
-      quantity: { type: Number, required: true },
-      price: { type: Number, required: true },
-      name: { type: String },
-    },
-  ],
-  customerInfo: {
-    name: { type: String, required: true },
-    email: { type: String, required: true },
-    phone: { type: String, required: true },
-    deliveryOption: { type: String },
-    deliveryAddress: { type: String, default: null },
-    pickupLocation: { type: String, default: null },
-    timeSlot: { type: String, default: null },
-    estimatedDelivery: { type: String },
-    transactionNumber: { type: String },
-  },
-  deliveryFee: { type: Number, default: 0 },
-  subtotal: { type: Number },
-  prescriptionUrl: { type: String },
-  totalAmount: { type: Number, required: true },
-  paymentDetails: { type: String, default: '' },
-  paymentReference: { type: String, required: true },
-  status: {
-    type: String,
-    enum: ['pending', 'processing', 'accepted', 'rejected', 'cancelled'],
-    default: 'pending',
-  },
-  deliveryStatus: {
-    type: String,
-    enum: ['pending', 'en_route', 'delivered'],
-    default: 'pending',
-  },
-  referralCodeUsed: {
-    type: String,
-    trim: true,
-    uppercase: true,
-    default: null,
-    index: true,
-  },
-  rider: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  riderName: { type: String },
-  trackingLinkShared: { type: Boolean, default: false },
-  trackingLinkSharedAt: { type: Date },
-  createdAt: { type: Date, default: Date.now },
-});
+  try {
+    // Basic validation
+    if (!customerInfo?.phone?.trim() || !customerInfo?.deliveryOption) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+    if (!cartItems?.length) {
+      return res.status(400).json({ message: 'Cart is empty' });
+    }
 
-module.exports = mongoose.model('Order', orderSchema);
+    // Validate items + calculate subtotal
+    let subtotal = 0;
+    const validatedItems = [];
+
+    for (const item of cartItems) {
+      const product = await Product.findById(item.productId);
+      if (!product) return res.status(400).json({ message: `Product not found: ${item.productId}` });
+      if (product.stock < item.quantity) {
+        return res.status(400).json({
+          message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
+        });
+      }
+
+      // Reserve stock immediately
+      product.stock -= item.quantity;
+      await product.save();
+
+      subtotal += product.price * item.quantity;
+      validatedItems.push({
+        productId: product._id,
+        quantity: item.quantity,
+        price: product.price,
+        name: product.name,
+      });
+    }
+
+    // Delivery fee
+    let deliveryFee = 0;
+    const option = customerInfo.deliveryOption.toLowerCase();
+    if (option === 'timeframe') deliveryFee = subtotal < 5000 ? 500 : 0;
+
+    const totalAmount = subtotal + deliveryFee;
+
+    // Store credit
+    let creditUsed = 0;
+    if (storeCreditApplied && user) {
+      const userDoc = await User.findById(user._id);
+      const available = userDoc?.storeCredit || 0;
+      if (available > 0) creditUsed = Math.min(available, totalAmount);
+    }
+
+    const finalPayable = Math.max(0, totalAmount - creditUsed);
+
+    // Save order as 'pending' — no transactionNumber yet
+    const order = new Order({
+      user: user?._id || null,
+      isGuest: !user,
+      guestIp: !user ? req.ip : undefined,
+      items: validatedItems,
+      customerInfo: {
+        name: customerInfo.name?.trim() || '',
+        email: customerInfo.email?.trim().toLowerCase() || '',
+        phone: customerInfo.phone.trim(),
+        deliveryOption: customerInfo.deliveryOption,
+        deliveryAddress: customerInfo.deliveryAddress?.trim() || null,
+        pickupLocation: customerInfo.pickupLocation?.trim() || null,
+        timeSlot: customerInfo.timeSlot || 'nil',
+        transactionNumber: '',           // filled in by webhook
+        estimatedDelivery: 'Pending confirmation',
+      },
+      deliveryFee,
+      subtotal,
+      totalAmount,
+      storeCreditUsed: creditUsed,
+      finalPayable,
+      referralCodeUsed: customerInfo.referralCode?.trim().toUpperCase() || null,
+      paymentReference: '',              // filled in by webhook
+      status: 'pending',
+      source: 'checkout',
+    });
+
+    const saved = await order.save();
+
+    // Deduct store credit now (reserved)
+    if (user && creditUsed > 0) {
+      await User.findByIdAndUpdate(user._id, { $inc: { storeCredit: -creditUsed } });
+    }
+
+    logger.info(`Pending order created: ${saved._id}`);
+
+    return res.status(201).json({
+      orderId: saved._id,
+      finalPayable,
+      totalAmount,
+      storeCreditApplied: creditUsed > 0,
+    });
+
+  } catch (error) {
+    logger.error(`createPendingOrder error: ${error.message}`);
+    return res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
 
 // ====================== FLUTTERWAVE WEBHOOK ======================
 // ====================== FLUTTERWAVE WEBHOOK ======================

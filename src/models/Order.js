@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const orderSchema = new mongoose.Schema({
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // null for guests
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   isGuest: { type: Boolean, default: false },
   guestIp: { type: String, default: null },
   items: [
@@ -53,4 +53,4 @@ const orderSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
-module.exports = mongoose.model('Order', orderSchema);
+module.exports = mongoose.models.Order || mongoose.model('Order', orderSchema);
