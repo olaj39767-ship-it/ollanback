@@ -7,34 +7,30 @@ const helmet = require("helmet");
 
 const app = express();
 
-// Load environment variables
 if (process.env.NODE_ENV !== "production") {
   dotenv.config({ path: path.resolve(__dirname, "../.env") });
 }
 
-// MongoDB Connection
 let isConnected = false;
 const connectDB = async () => {
   if (!isConnected) {
     await mongoose.connect(process.env.MONGO_URI);
     isConnected = true;
     console.log("✅ MongoDB connected");
+
+    // Start cleanup job AFTER DB is connected
+    require("./utils/cleanupPendingOrders");
   }
 };
 
-// ── CORS ─────────────────────────────────────────────────────
 const corsOptions = {
-  origin: [
-    "https://www.ollanpharmacy.ng",
-    "http://localhost:3000",
-  ],
+  origin: ["https://www.ollanpharmacy.ng", "http://localhost:3000"],
   credentials: true,
   optionsSuccessStatus: 200,
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
 };
 
-// ── Manual NoSQL injection sanitizer (replaces express-mongo-sanitize) ───
 const sanitize = (obj) => {
   if (obj && typeof obj === "object") {
     for (const key of Object.keys(obj)) {
@@ -54,11 +50,20 @@ const mongoSanitizeMiddleware = (req, res, next) => {
   next();
 };
 
-// ── Middleware ────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors(corsOptions));
+
+// ── Webhook MUST come before express.json() ───────────────────
+// Flutterwave needs the raw body for signature verification
+app.use(
+  "/api/orders/webhook/flutterwave",
+  express.raw({ type: "application/json" }),
+  require("./routes/orderRoute").webhookRouter
+);
+
+// ── JSON parsing for all other routes ────────────────────────
 app.use(express.json({ limit: "10kb" }));
-app.use(mongoSanitizeMiddleware); // ✅ replaces express-mongo-sanitize
+app.use(mongoSanitizeMiddleware);
 
 // ── Static files ──────────────────────────────────────────────
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));

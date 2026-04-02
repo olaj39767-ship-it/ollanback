@@ -199,6 +199,203 @@ exports.createOrder = async (req, res) => {
   }
 };
 
+// ====================== CREATE PENDING ORDER (before payment) ======================
+exports.createPendingOrder = async (req, res) => {
+  const user = req.user || null;
+  const { customerInfo, items: cartItems, storeCreditApplied = false } = req.body;
+
+  try {
+    // Basic validation
+    if (!customerInfo?.phone?.trim() || !customerInfo?.deliveryOption) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+    if (!cartItems?.length) {
+      return res.status(400).json({ message: 'Cart is empty' });
+    }
+
+    // Validate items + calculate subtotal
+    let subtotal = 0;
+    const validatedItems = [];
+
+    for (const item of cartItems) {
+      const product = await Product.findById(item.productId);
+      if (!product) return res.status(400).json({ message: `Product not found: ${item.productId}` });
+      if (product.stock < item.quantity) {
+        return res.status(400).json({
+          message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
+        });
+      }
+
+      // Reserve stock immediately
+      product.stock -= item.quantity;
+      await product.save();
+
+      subtotal += product.price * item.quantity;
+      validatedItems.push({
+        productId: product._id,
+        quantity: item.quantity,
+        price: product.price,
+        name: product.name,
+      });
+    }
+
+    // Delivery fee
+    let deliveryFee = 0;
+    const option = customerInfo.deliveryOption.toLowerCase();
+    if (option === 'timeframe') deliveryFee = subtotal < 5000 ? 500 : 0;
+
+    const totalAmount = subtotal + deliveryFee;
+
+    // Store credit
+    let creditUsed = 0;
+    if (storeCreditApplied && user) {
+      const userDoc = await User.findById(user._id);
+      const available = userDoc?.storeCredit || 0;
+      if (available > 0) creditUsed = Math.min(available, totalAmount);
+    }
+
+    const finalPayable = Math.max(0, totalAmount - creditUsed);
+
+    // Save order as 'pending' — no transactionNumber yet
+    const order = new Order({
+      user: user?._id || null,
+      isGuest: !user,
+      guestIp: !user ? req.ip : undefined,
+      items: validatedItems,
+      customerInfo: {
+        name: customerInfo.name?.trim() || '',
+        email: customerInfo.email?.trim().toLowerCase() || '',
+        phone: customerInfo.phone.trim(),
+        deliveryOption: customerInfo.deliveryOption,
+        deliveryAddress: customerInfo.deliveryAddress?.trim() || null,
+        pickupLocation: customerInfo.pickupLocation?.trim() || null,
+        timeSlot: customerInfo.timeSlot || 'nil',
+        transactionNumber: '',           // filled in by webhook
+        estimatedDelivery: 'Pending confirmation',
+      },
+      deliveryFee,
+      subtotal,
+      totalAmount,
+      storeCreditUsed: creditUsed,
+      finalPayable,
+      referralCodeUsed: customerInfo.referralCode?.trim().toUpperCase() || null,
+      paymentReference: '',              // filled in by webhook
+      status: 'pending',
+      source: 'checkout',
+    });
+
+    const saved = await order.save();
+
+    // Deduct store credit now (reserved)
+    if (user && creditUsed > 0) {
+      await User.findByIdAndUpdate(user._id, { $inc: { storeCredit: -creditUsed } });
+    }
+
+    logger.info(`Pending order created: ${saved._id}`);
+
+    return res.status(201).json({
+      orderId: saved._id,
+      finalPayable,
+      totalAmount,
+      storeCreditApplied: creditUsed > 0,
+    });
+
+  } catch (error) {
+    logger.error(`createPendingOrder error: ${error.message}`);
+    return res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ====================== FLUTTERWAVE WEBHOOK ======================
+// ====================== FLUTTERWAVE WEBHOOK ======================
+exports.handleFlutterwaveWebhook = async (req, res) => {
+  // 1. Verify signature
+  const signature = req.headers['verif-hash'];
+  if (!signature || signature !== process.env.FLW_SECRET_HASH) {
+    logger.warn('Webhook: invalid signature');
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+
+  // 2. Parse body
+  let payload;
+  try {
+    payload = JSON.parse(req.body.toString());
+  } catch {
+    return res.status(400).json({ message: 'Invalid JSON' });
+  }
+
+  const { event, data } = payload;
+
+  // 3. Only care about successful charges
+  if (event !== 'charge.completed' || data?.status !== 'successful') {
+    return res.status(200).json({ message: 'Ignored' });
+  }
+
+  const transactionId = String(data.id);
+  const txRef = data.tx_ref;                    // contains your orderId
+  const amountPaid = data.amount;
+
+  try {
+    // 4. Find the pending order using orderId stored in tx_ref
+    //    tx_ref format: "{orderId}-{timestamp}"  (set by client — see step 3)
+    const orderId = txRef.split('-flw-')[0];     // e.g. "6849abc..."-flw-1717000000
+    const order = await Order.findById(orderId);
+
+    if (!order) {
+      logger.warn(`Webhook: no order found for orderId ${orderId}`);
+      return res.status(200).json({ message: 'Order not found' });
+    }
+
+    // 5. Prevent double-processing
+    if (order.status !== 'pending') {
+      logger.info(`Webhook: order ${orderId} already processed (${order.status})`);
+      return res.status(200).json({ message: 'Already processed' });
+    }
+
+    // 6. Verify amount matches (tolerance for kobo rounding)
+    if (amountPaid < order.finalPayable - 1) {
+      logger.warn(`Webhook: amount mismatch. Expected ₦${order.finalPayable}, got ₦${amountPaid}`);
+      return res.status(200).json({ message: 'Amount mismatch' });
+    }
+
+    // 7. Update order to processing
+    order.status = 'processing';
+    order.customerInfo.transactionNumber = transactionId;
+    order.paymentReference = txRef;
+    order.flwTransactionId = transactionId;
+    order.flwTxRef = txRef;
+    await order.save();
+
+    // 8. Apply referral bonus if applicable
+    if (order.referralCodeUsed) {
+      const referrer = await User.findOne({ referralCode: order.referralCodeUsed });
+      if (referrer) {
+        const bonus = Math.round(order.subtotal * 0.1 * 100) / 100;
+        referrer.addStoreCredit(bonus);
+        await referrer.save();
+        logger.info(`Referral bonus ₦${bonus} credited to ${referrer.email}`);
+      }
+    }
+
+    // 9. Notify
+    orderEventManager.broadcastOrderUpdate({
+      type: 'new_order',
+      order,
+      message: `Payment confirmed for order #${order._id.toString().slice(-6)}`,
+    });
+
+    invalidateAdminOrdersCache();
+    await sendOrderNotification(order, 'processing');
+
+    logger.info(`Webhook: order ${orderId} updated to processing`);
+    return res.status(200).json({ message: 'OK' });
+
+  } catch (error) {
+    logger.error(`Webhook error: ${error.message}`);
+    return res.status(200).json({ message: 'Error handled' }); // always 200
+  }
+};
+
 // ====================== VERIFY PAYMENT + 3% REFERRAL BONUS ======================
 exports.verifyPayment = async (req, res) => {
   const { orderId, paymentDetails } = req.body;
@@ -230,7 +427,7 @@ exports.verifyPayment = async (req, res) => {
         referrer.addStoreCredit(bonusAmount);
         await referrer.save();
 
-        logger.info(`✅ 3% Referral bonus: ${bonusAmount} credited to ${referrer.email} | Code: ${updatedOrder.referralCodeUsed} | Order: ${orderId}`);
+        logger.info(`✅ 10% Referral bonus: ${bonusAmount} credited to ${referrer.email} | Code: ${updatedOrder.referralCodeUsed} | Order: ${orderId}`);
       } else {
         logger.warn(`Referral code ${updatedOrder.referralCodeUsed} used but no matching user found`);
       }
@@ -308,7 +505,7 @@ exports.getReferralAnalytics = async (req, res) => {
       ]);
 
       const totalEarned = totalBonusResult.length > 0 
-        ? Math.round(totalBonusResult[0].totalSubtotal * 0.03 * 100) / 100 
+        ? Math.round(totalBonusResult[0].totalSubtotal * 0.1 * 100) / 100 
         : 0;
 
       analytics.push({
