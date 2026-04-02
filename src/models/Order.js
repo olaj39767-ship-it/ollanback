@@ -28,7 +28,7 @@ const orderSchema = new mongoose.Schema({
   prescriptionUrl: { type: String },
   totalAmount: { type: Number, required: true },
   paymentDetails: { type: String, default: '' },
-  paymentReference: { type: String, required: true },
+  paymentReference: { type: String, default: '' },
   status: {
     type: String,
     enum: ['pending', 'processing', 'accepted', 'rejected', 'cancelled'],
