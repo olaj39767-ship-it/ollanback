@@ -10,11 +10,16 @@ const productSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  price: {
-    type: Number,
-    required: true,
-    min: 0
-  },
+price: {
+  type: Number,
+  required: true,
+  min: 0
+},
+priceInCongo: {
+  type: Number,
+  default: null,
+  min: 0
+},
   stock: {
     type: Number,
     required: true,

@@ -4,14 +4,13 @@ const orderSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   isGuest: { type: Boolean, default: false },
   guestIp: { type: String, default: null },
-  items: [
-    {
-      productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
-      quantity: { type: Number, required: true },
-      price: { type: Number, required: true },
-      name: { type: String },
-    },
-  ],
+  items: [{
+  productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+  quantity: Number,
+  price: Number,
+  name: String,
+  unit: { type: String, enum: ['kg', 'congo'], default: 'kg' },  // ADD THIS
+}],
   customerInfo: {
     name: { type: String, required: true },
     email: { type: String, required: true },

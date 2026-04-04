@@ -80,29 +80,35 @@ exports.createOrder = async (req, res) => {
     let subtotal = 0;
     const validatedItems = [];
 
-    for (const item of cartItems) {
-      const product = await Product.findById(item.productId);
-      if (!product) {
-        return res.status(400).json({ message: `Product not found: ${item.productId}` });
-      }
+   for (const item of cartItems) {
+  const product = await Product.findById(item.productId);
+  if (!product) {
+    return res.status(400).json({ message: `Product not found: ${item.productId}` });
+  }
+  if (product.stock < item.quantity) {
+    return res.status(400).json({
+      message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
+    });
+  }
 
-      if (product.stock < item.quantity) {
-        return res.status(400).json({
-          message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
-        });
-      }
+  // Use priceInCongo if unit is "congo" and the field exists, else fall back to price
+  const unitPrice =
+    item.unit === "congo" && product.priceInCongo != null
+      ? product.priceInCongo
+      : product.price;
 
-      product.stock -= item.quantity;
-      await product.save();
+  product.stock -= item.quantity;
+  await product.save();
 
-      subtotal += product.price * item.quantity;
-      validatedItems.push({
-        productId: product._id,
-        quantity: item.quantity,
-        price: product.price,
-        name: product.name,
-      });
-    }
+  subtotal += unitPrice * item.quantity;
+  validatedItems.push({
+    productId: product._id,
+    quantity: item.quantity,
+    price: unitPrice,        // store the actual price charged
+    name: product.name,
+    unit: item.unit ?? "kg", // store unit for record
+  });
+}
 
     let deliveryFee = 0;
     const option = customerInfo.deliveryOption.toLowerCase();
@@ -217,29 +223,35 @@ exports.createPendingOrder = async (req, res) => {
     let subtotal = 0;
     const validatedItems = [];
 
-    for (const item of cartItems) {
-      const product = await Product.findById(item.productId);
-      if (!product) {
-        return res.status(400).json({ message: `Product not found: ${item.productId}` });
-      }
-      if (product.stock < item.quantity) {
-        return res.status(400).json({
-          message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
-        });
-      }
+  for (const item of cartItems) {
+  const product = await Product.findById(item.productId);
+  if (!product) {
+    return res.status(400).json({ message: `Product not found: ${item.productId}` });
+  }
+  if (product.stock < item.quantity) {
+    return res.status(400).json({
+      message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
+    });
+  }
 
-      // Reserve stock immediately
-      product.stock -= item.quantity;
-      await product.save();
+  // Use priceInCongo if unit is "congo" and the field exists, else fall back to price
+  const unitPrice =
+    item.unit === "congo" && product.priceInCongo != null
+      ? product.priceInCongo
+      : product.price;
 
-      subtotal += product.price * item.quantity;
-      validatedItems.push({
-        productId: product._id,
-        quantity: item.quantity,
-        price: product.price,
-        name: product.name,
-      });
-    }
+  product.stock -= item.quantity;
+  await product.save();
+
+  subtotal += unitPrice * item.quantity;
+  validatedItems.push({
+    productId: product._id,
+    quantity: item.quantity,
+    price: unitPrice,        // store the actual price charged
+    name: product.name,
+    unit: item.unit ?? "kg", // store unit for record
+  });
+}
 
     // Delivery fee logic
     let deliveryFee = 0;

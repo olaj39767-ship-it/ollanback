@@ -88,7 +88,7 @@ exports.getAllPrescriptions = async (req, res) => {
   }
 };
 exports.createProduct = async (req, res) => {
-  const { name, description, price, stock, category } = req.body;
+  const { name, description, price, priceInCongo, stock, category } = req.body;
   let uploadedImage = null;
   
   try {
@@ -115,6 +115,7 @@ exports.createProduct = async (req, res) => {
       name,
       description,
       price: parseFloat(price),
+      priceInCongo: priceInCongo ? parseFloat(priceInCongo) : null,
       stock: parseInt(stock),
       category,
       image: uploadedImage ? uploadedImage.secure_url : null, // Cloudinary URL
@@ -154,7 +155,7 @@ exports.getProducts = async (req, res) => {
 
 exports.updateProduct = async (req, res) => {
   const { id } = req.params;
-  const { name, description, price, stock, category } = req.body;
+const { name, description, price, priceInCongo, stock, category } = req.body;
   let uploadedImage = null;
   let oldImagePublicId = null;
   
@@ -186,6 +187,9 @@ exports.updateProduct = async (req, res) => {
       price: price !== undefined && price !== '' ? parseFloat(price) : existingProduct.price,
       stock: stock !== undefined && stock !== '' ? parseInt(stock) : existingProduct.stock,
       category: category || existingProduct.category,
+      priceInCongo: priceInCongo !== undefined && priceInCongo !== '' 
+  ? parseFloat(priceInCongo) 
+  : existingProduct.priceInCongo,
     };
 
     // Add image data if new image was uploaded
