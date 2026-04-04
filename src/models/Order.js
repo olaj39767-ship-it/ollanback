@@ -51,6 +51,12 @@ const orderSchema = new mongoose.Schema({
   trackingLinkShared: { type: Boolean, default: false },
   trackingLinkSharedAt: { type: Date },
   createdAt: { type: Date, default: Date.now },
+  // orderSchema additions
+storeCreditApplied: { type: Boolean, default: false },
+storeCreditAmount: { type: Number, default: 0 },
+finalPayable: { type: Number }, // what Flutterwave actually charges
+flwTransactionId: { type: String, default: null },
+flwTxRef: { type: String, default: null },
 });
 
 module.exports = mongoose.models.Order || mongoose.model('Order', orderSchema);

@@ -219,7 +219,9 @@ exports.createPendingOrder = async (req, res) => {
 
     for (const item of cartItems) {
       const product = await Product.findById(item.productId);
-      if (!product) return res.status(400).json({ message: `Product not found: ${item.productId}` });
+      if (!product) {
+        return res.status(400).json({ message: `Product not found: ${item.productId}` });
+      }
       if (product.stock < item.quantity) {
         return res.status(400).json({
           message: `Insufficient stock for ${product.name} (only ${product.stock} left)`,
@@ -239,24 +241,25 @@ exports.createPendingOrder = async (req, res) => {
       });
     }
 
-    // Delivery fee
+    // Delivery fee logic
     let deliveryFee = 0;
     const option = customerInfo.deliveryOption.toLowerCase();
     if (option === 'timeframe') deliveryFee = subtotal < 5000 ? 500 : 0;
 
     const totalAmount = subtotal + deliveryFee;
 
-    // Store credit
+    // Store credit — only apply if logged in and cart meets minimum
+    const STORE_CREDIT_MIN = 2500;
     let creditUsed = 0;
-    if (storeCreditApplied && user) {
+    if (storeCreditApplied && user && subtotal >= STORE_CREDIT_MIN) {
       const userDoc = await User.findById(user._id);
-      const available = userDoc?.storeCredit || 0;
+      const available = userDoc?.storeCredit ?? 0;
       if (available > 0) creditUsed = Math.min(available, totalAmount);
     }
 
     const finalPayable = Math.max(0, totalAmount - creditUsed);
 
-    // Save order as 'pending' — no transactionNumber yet
+    // Create the pending order
     const order = new Order({
       user: user?._id || null,
       isGuest: !user,
@@ -270,34 +273,31 @@ exports.createPendingOrder = async (req, res) => {
         deliveryAddress: customerInfo.deliveryAddress?.trim() || null,
         pickupLocation: customerInfo.pickupLocation?.trim() || null,
         timeSlot: customerInfo.timeSlot || 'nil',
-        transactionNumber: '',           // filled in by webhook
+        transactionNumber: '',
         estimatedDelivery: 'Pending confirmation',
       },
       deliveryFee,
       subtotal,
       totalAmount,
-      storeCreditUsed: creditUsed,
-      finalPayable,
+      storeCreditUsed: creditUsed,   // ← requires schema field
+      finalPayable,                  // ← requires schema field
       referralCodeUsed: customerInfo.referralCode?.trim().toUpperCase() || null,
-      paymentReference: '',              // filled in by webhook
+      paymentReference: '',
       status: 'pending',
-      source: 'checkout',
     });
 
     const saved = await order.save();
 
-    // Deduct store credit now (reserved)
-    if (user && creditUsed > 0) {
-      await User.findByIdAndUpdate(user._id, { $inc: { storeCredit: -creditUsed } });
-    }
+    // ✅ Do NOT deduct store credit here — wait for payment confirmation in webhook
 
-    logger.info(`Pending order created: ${saved._id}`);
+    logger.info(`Pending order created: ${saved._id} | finalPayable: ₦${finalPayable} | creditUsed: ₦${creditUsed}`);
 
     return res.status(201).json({
       orderId: saved._id,
       finalPayable,
       totalAmount,
       storeCreditApplied: creditUsed > 0,
+      storeCreditAmount: creditUsed,
     });
 
   } catch (error) {
@@ -305,7 +305,6 @@ exports.createPendingOrder = async (req, res) => {
     return res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
-
 // ====================== FLUTTERWAVE WEBHOOK ======================
 // ====================== FLUTTERWAVE WEBHOOK ======================
 exports.handleFlutterwaveWebhook = async (req, res) => {
@@ -326,20 +325,19 @@ exports.handleFlutterwaveWebhook = async (req, res) => {
 
   const { event, data } = payload;
 
-  // 3. Only care about successful charges
+  // 3. Only process successful charges
   if (event !== 'charge.completed' || data?.status !== 'successful') {
     return res.status(200).json({ message: 'Ignored' });
   }
 
   const transactionId = String(data.id);
-  const txRef = data.tx_ref;                    // contains your orderId
-  const amountPaid = data.amount;
+  const txRef        = data.tx_ref;
+  const amountPaid   = data.amount;
 
   try {
-    // 4. Find the pending order using orderId stored in tx_ref
-    //    tx_ref format: "{orderId}-{timestamp}"  (set by client — see step 3)
-    const orderId = txRef.split('-flw-')[0];     // e.g. "6849abc..."-flw-1717000000
-    const order = await Order.findById(orderId);
+    // 4. Extract orderId from tx_ref (format: "{orderId}-flw-{timestamp}")
+    const orderId = txRef.split('-flw-')[0];
+    const order   = await Order.findById(orderId);
 
     if (!order) {
       logger.warn(`Webhook: no order found for orderId ${orderId}`);
@@ -352,47 +350,57 @@ exports.handleFlutterwaveWebhook = async (req, res) => {
       return res.status(200).json({ message: 'Already processed' });
     }
 
-    // 6. Verify amount matches (tolerance for kobo rounding)
+    // 6. Verify amount paid matches finalPayable (1 naira tolerance for rounding)
     if (amountPaid < order.finalPayable - 1) {
-      logger.warn(`Webhook: amount mismatch. Expected ₦${order.finalPayable}, got ₦${amountPaid}`);
+      logger.warn(`Webhook: amount mismatch on order ${orderId}. Expected ₦${order.finalPayable}, got ₦${amountPaid}`);
       return res.status(200).json({ message: 'Amount mismatch' });
     }
 
-    // 7. Update order to processing
-    order.status = 'processing';
+    // 7. Mark order as processing
+    order.status                        = 'processing';
     order.customerInfo.transactionNumber = transactionId;
-    order.paymentReference = txRef;
-    order.flwTransactionId = transactionId;
-    order.flwTxRef = txRef;
+    order.paymentReference              = txRef;
+    order.flwTransactionId              = transactionId; // ← requires schema field
+    order.flwTxRef                      = txRef;         // ← requires schema field
     await order.save();
 
-    // 8. Apply referral bonus if applicable
+    // 8. Deduct store credit now that payment is confirmed
+    if (order.storeCreditUsed > 0 && order.user) {
+      await User.findByIdAndUpdate(order.user, {
+        $inc: { storeCredit: -order.storeCreditUsed },
+      });
+      logger.info(`Store credit: ₦${order.storeCreditUsed} deducted from user ${order.user} for order ${orderId}`);
+    }
+
+    // 9. Apply referral bonus (10% of subtotal to referrer)
     if (order.referralCodeUsed) {
       const referrer = await User.findOne({ referralCode: order.referralCodeUsed });
       if (referrer) {
         const bonus = Math.round(order.subtotal * 0.1 * 100) / 100;
-        referrer.addStoreCredit(bonus);
+        referrer.storeCredit = (referrer.storeCredit ?? 0) + bonus;
         await referrer.save();
-        logger.info(`Referral bonus ₦${bonus} credited to ${referrer.email}`);
+        logger.info(`Referral bonus: ₦${bonus} credited to ${referrer.email} (code: ${order.referralCodeUsed})`);
+      } else {
+        logger.warn(`Referral code ${order.referralCodeUsed} used but no matching user found`);
       }
     }
 
-    // 9. Notify
+    // 10. Broadcast + notify
     orderEventManager.broadcastOrderUpdate({
       type: 'new_order',
       order,
-      message: `Payment confirmed for order #${order._id.toString().slice(-6)}`,
+      message: `Payment confirmed for order #${orderId.slice(-6)}`,
     });
 
     invalidateAdminOrdersCache();
     await sendOrderNotification(order, 'processing');
 
-    logger.info(`Webhook: order ${orderId} updated to processing`);
+    logger.info(`Webhook: order ${orderId} → processing | tx: ${transactionId}`);
     return res.status(200).json({ message: 'OK' });
 
   } catch (error) {
     logger.error(`Webhook error: ${error.message}`);
-    return res.status(200).json({ message: 'Error handled' }); // always 200
+    return res.status(200).json({ message: 'Error handled' }); // always 200 to Flutterwave
   }
 };
 
