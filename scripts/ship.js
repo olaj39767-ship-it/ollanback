@@ -26,8 +26,17 @@ rl.question('Commit message: ', (message) => {
       `git remote set-url origin https://${token}@github.com/olaj39767-ship-it/ollanback.git`,
       { stdio: 'inherit' }
     );
+
     execSync('git add .', { stdio: 'inherit' });
-    execSync(`git commit -m "${message}"`, { stdio: 'inherit' });
+
+    // Check if there's anything to commit
+    const status = execSync('git status --porcelain').toString().trim();
+    if (status) {
+      execSync(`git commit -m "${message}"`, { stdio: 'inherit' });
+    } else {
+      console.log('ℹ️  Nothing new to commit, pushing existing commits...');
+    }
+
     execSync('git push origin main', { stdio: 'inherit' });
     console.log('✅ Shipped!');
   } catch (err) {
