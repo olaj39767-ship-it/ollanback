@@ -38,6 +38,6 @@ router.post('/share-tracking', authMiddleware, roleMiddleware(['admin']), orderC
 router.post('/upload-prescription', upload.single('prescription'), ProductController.uploadPrescription);
 router.get('/prescriptions', ProductController.getAllPrescriptions);
 router.post('/clear-cache', authMiddleware, roleMiddleware(['admin']), orderController.clearOrderCache);
-
+router.delete('/cleanup-stale', authMiddleware, adminMiddleware, orderController.cleanupStalePendingOrders);
 module.exports = router;
 module.exports.webhookRouter = webhookRouter;

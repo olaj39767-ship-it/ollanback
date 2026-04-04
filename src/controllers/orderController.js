@@ -473,6 +473,51 @@ exports.verifyPayment = async (req, res) => {
   }
 };
 
+// ====================== CLEANUP STALE PENDING ORDERS ======================
+exports.cleanupStalePendingOrders = async (req, res) => {
+  try {
+    if (req.user?.role !== 'admin') {
+      return res.status(403).json({ message: 'Unauthorized' });
+    }
+
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+    const staleOrders = await Order.find({
+      status: 'pending',
+      createdAt: { $lt: oneHourAgo },
+    });
+
+    if (staleOrders.length === 0) {
+      return res.json({ message: 'No stale pending orders found', cleaned: 0 });
+    }
+
+    // Restore stock for each stale order before deleting
+    for (const order of staleOrders) {
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(item.productId, {
+          $inc: { stock: item.quantity },
+        });
+      }
+    }
+
+    const orderIds = staleOrders.map((o) => o._id);
+    await Order.deleteMany({ _id: { $in: orderIds } });
+
+    invalidateAdminOrdersCache();
+
+    logger.info(`Cleaned up ${staleOrders.length} stale pending orders older than 1 hour`);
+
+    return res.json({
+      message: `Cleaned up ${staleOrders.length} stale pending order(s)`,
+      cleaned: staleOrders.length,
+      orderIds,
+    });
+  } catch (error) {
+    logger.error(`Cleanup stale orders error: ${error.message}`);
+    return res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
 // ====================== UPLOAD PRESCRIPTION ======================
 exports.uploadPrescription = async (req, res) => {
   try {
